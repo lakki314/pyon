@@ -1,0 +1,44 @@
+flowchart TD
+    A[Start] --> B[Precheck certificate for renewal]
+
+    B -->|Precheck failed| P1[Fail End]
+    B -->|Precheck passed / renewal required| C[Raise change request]
+
+    C --> D[Implement change request]
+    D --> E[Renew certificate]
+
+    E -->|Renew success| F[Deploy certificate keystore to server]
+    E -->|Renew failed| R1[Failure node<br/>Set status unsuccessful<br/>Add renew failure information]
+
+    F -->|Keystore deploy success| G[Deploy certificate to IHS server]
+    F -->|Keystore deploy failed| K1[Failure node<br/>Set status unsuccessful<br/>Add keystore deployment failure information]
+
+    G -->|IHS deploy success| S1[Close change request as successful<br/>with success information]
+    G -->|IHS deploy failed| I1[Failure node<br/>Set status unsuccessful<br/>Add IHS deployment failure information]
+
+    %% Shared failure handling for renew + keystore failures
+    R1 --> CF1[Close change request as unsuccessful]
+    K1 --> CF1
+
+    CF1 --> CF2[Raise incident]
+    CF2 --> CF3[Update change request with incident details]
+    CF3 --> CF4[Send failure notification]
+    CF4 --> X1[End]
+
+    %% IHS failure path with approval + retry
+    I1 --> IC1[Close change request as unsuccessful]
+    IC1 --> IC2[Raise incident]
+    IC2 --> IC3[Update change request with incident details]
+    IC3 --> A1[Approval gate]
+    A1 --> A2[Retry failed IHS nodes]
+
+    A2 -->|Retry success| A3[Close incident]
+    A3 --> A4[Send success notification to team]
+    A4 --> X2[End]
+
+    A2 -->|Retry failure| A5[Send failure notification to team]
+    A5 --> X3[End]
+
+    %% Success path
+    S1 --> S2[Send success notification]
+    S2 --> X4[End]
