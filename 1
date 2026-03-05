@@ -1,0 +1,728 @@
+Recommended payload (valid YAML + easiest to execute)
+
+Your intent is perfect; the clean YAML shape is:
+
+jvm_restart:
+  ritm_number: RITM1234
+  hosts:
+    test1:
+      websphere_profile_name1:
+        - websphere_jvm_name1
+        - websphere_jvm_name2
+    test2:
+      websphere_profile_name2:
+        - websphere_jvm_name3
+        - websphere_jvm_name4
+
+Why this is “better execution”:
+
+No awkward list nesting
+
+Hostnames are keys (easy dynamic inventory)
+
+Profiles are keys under host
+
+JVMs are simple lists (easy flattening into {profile_name, jvm_name} work items)
+
+Updated playbook + role (FULL CONTENTS)
+Layout
+jvm_restart_websphere.yml
+roles/
+  websphere_jvm_restart/
+    defaults/
+      main.yml
+    tasks/
+      main.yml
+      restart_one.yml
+      banner_set.yml
+      banner_cleanup.yml
+      snow_update.yml
+1) Playbook: jvm_restart_websphere.yml
+What it does
+
+Reads jvm_restart.hosts and builds a dynamic group jvm_restart_targets
+
+Flattens each host’s profiles/JVMs into restart_requests
+
+Runs the role in parallel across hosts
+
+Aggregates results and sends ONE ServiceNow update with:
+
+status: failed if any JVM failed
+
+failed_hosts: ["host:profile:jvm", ...]
+
+---
+- name: Build dynamic inventory from payload (host -> profile -> jvms)
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Validate payload exists
+      assert:
+        that:
+          - jvm_restart is defined
+          - jvm_restart is mapping
+        fail_msg: "Expected extra_vars to contain 'jvm_restart' as a dictionary."
+
+    - name: Extract RITM number
+      set_fact:
+        ritm_number: >-
+          {{
+            jvm_restart.get('ritm_number')
+            or jvm_restart.get('RITM number')
+            or jvm_restart.get('ritmNumber')
+          }}
+
+    - name: Ensure RITM is present
+      assert:
+        that:
+          - ritm_number is defined
+          - ritm_number | length > 0
+        fail_msg: "ritm_number is missing from payload."
+
+    - name: Extract hosts map
+      set_fact:
+        hosts_map: "{{ jvm_restart.get('hosts', {}) }}"
+
+    - name: Validate hosts map
+      assert:
+        that:
+          - hosts_map is mapping
+          - (hosts_map | length) > 0
+        fail_msg: "Payload must contain jvm_restart.hosts as a mapping host -> profile -> [jvms]."
+
+    - name: Add hosts to dynamic group with flattened restart_requests
+      add_host:
+        name: "{{ item.key }}"
+        groups: "jvm_restart_targets"
+        ritm_number: "{{ ritm_number }}"
+        restart_requests: >-
+          {%- set out = [] -%}
+          {%- for p in (item.value | dict2items) -%}
+            {%- for j in (p.value | default([])) -%}
+              {%- set _ = out.append({'profile_name': p.key, 'jvm_name': j}) -%}
+            {%- endfor -%}
+          {%- endfor -%}
+          {{ out }}
+      loop: "{{ hosts_map | dict2items }}"
+
+- name: Restart WebSphere JVMs in parallel per host
+  hosts: jvm_restart_targets
+  gather_facts: false
+  strategy: free
+  roles:
+    - websphere_jvm_restart
+
+- name: Aggregate results and send ONE ServiceNow update
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Collect all JVM results from all hosts
+      set_fact:
+        all_jvm_results: "{{ (all_jvm_results | default([])) + (hostvars[item].jvm_results | default([])) }}"
+      loop: "{{ groups['jvm_restart_targets'] | default([]) }}"
+
+    - name: Build failed_hosts as ["host:profile:jvm", ...]
+      set_fact:
+        failed_hosts: >-
+          {{
+            (all_jvm_results | default([])
+              | selectattr('status','equalto','failed')
+              | map(attribute='host_profile_jvm')
+              | list)
+          }}
+
+    - name: Determine overall status
+      set_fact:
+        overall_status: "{{ 'failed' if (failed_hosts | length > 0) else 'success' }}"
+        success_count: "{{ (all_jvm_results | default([]) | selectattr('status','equalto','success') | list | length) }}"
+        fail_count: "{{ failed_hosts | length }}"
+        total_count: "{{ all_jvm_results | default([]) | length }}"
+
+    - name: Build ServiceNow payload
+      set_fact:
+        snow_body_info:
+          status: "{{ overall_status }}"
+          ritm_number: "{{ ritm_number }}"
+          failed_hosts: "{{ failed_hosts }}"
+          message: >-
+            JVM restart summary for RITM {{ ritm_number }}.
+            Total: {{ total_count }}, Success: {{ success_count }}, Failed: {{ fail_count }}.
+
+    - name: Send ServiceNow update (one call)
+      include_role:
+        name: websphere_jvm_restart
+        tasks_from: snow_update.yml
+2) Role defaults: roles/websphere_jvm_restart/defaults/main.yml
+
+Adds banner controls + stop timeout settings + install roots.
+
+---
+restart_ps_cmd: "ps -ef | grep java | grep {{ jvm_name }} | grep -v grep"
+
+restart_wait_retries: 30
+restart_wait_delay: 10
+
+# stopServer timeout + PID polling
+stop_timeout_seconds: 600   # 10 minutes
+stop_check_delay: 15        # poll interval
+
+# install roots priority
+was_install_roots:
+  - "/opt/wps8/websphere/AppServer/85/"
+  - "/opt/websphere/85/commonprofile/AppServer"
+  - "/opt/websphere/90/commonprofile/AppServer"
+  - "/opt/websphere/85/AppServer/"
+
+# Banner behavior (writes to jvm_owner .profile)
+restart_banner_enabled: true
+restart_banner_status_filename: ".was_jvm_restart_status"
+restart_banner_profile_filename: ".profile"
+restart_banner_block_id: "ANSIBLE MANAGED - WAS JVM RESTART BANNER"
+
+# ServiceNow (called once from aggregation play)
+snow_enabled: true
+snow_instance_url: ""
+snow_update_path: ""
+snow_validate_certs: true
+
+snow_user: ""
+snow_password: ""
+snow_bearer_token: ""
+3) Role main: roles/websphere_jvm_restart/tasks/main.yml
+What it does
+
+Initializes:
+
+jvm_results (per-host results list)
+
+owners_touched (list of jvm_owner usernames modified for banner)
+
+Processes all JVM requests
+
+Always cleans up banners at end of host (even if some JVMs fail)
+
+---
+- name: Initialize per-host tracking
+  set_fact:
+    jvm_results: "{{ jvm_results | default([]) }}"
+    owners_touched: "{{ owners_touched | default([]) }}"
+
+- name: Validate restart_requests
+  assert:
+    that:
+      - restart_requests is defined
+      - restart_requests is sequence
+      - restart_requests | length > 0
+    fail_msg: "No restart_requests provided for host {{ inventory_hostname }}."
+
+- name: Process all JVMs on this host, then cleanup banner
+  block:
+    - name: Process each JVM request (sequential per host)
+      include_tasks: restart_one.yml
+      loop: "{{ restart_requests }}"
+      loop_control:
+        loop_var: req
+        label: "{{ inventory_hostname }} -> {{ req.profile_name }}/{{ req.jvm_name }}"
+
+  always:
+    - name: Cleanup banners for owners touched on this host
+      include_tasks: banner_cleanup.yml
+      when: restart_banner_enabled | bool
+4) Banner set task: roles/websphere_jvm_restart/tasks/banner_set.yml
+What it does
+
+For the current jvm_owner:
+
+Ensures .profile contains a managed block that prints the status file if it exists
+
+Writes/updates the status file content so logins show:
+
+RITM
+
+host
+
+profile
+
+jvm
+
+“restart in progress”
+
+Tracks owners_touched for cleanup
+
+---
+- name: Determine home directory for {{ jvm_owner }}
+  shell: "getent passwd {{ jvm_owner }} | cut -d: -f6 || echo /home/{{ jvm_owner }}"
+  register: _home_dir
+  changed_when: false
+  failed_when: false
+
+- name: Set banner paths
+  set_fact:
+    jvm_home: "{{ _home_dir.stdout | trim }}"
+    jvm_profile_file: "{{ (_home_dir.stdout | trim) ~ '/' ~ restart_banner_profile_filename }}"
+    jvm_status_file: "{{ (_home_dir.stdout | trim) ~ '/' ~ restart_banner_status_filename }}"
+
+- name: Ensure .profile prints restart banner when status file exists
+  blockinfile:
+    path: "{{ jvm_profile_file }}"
+    create: true
+    marker: "# {mark} {{ restart_banner_block_id }}"
+    block: |
+      if [ -f "$HOME/{{ restart_banner_status_filename }}" ]; then
+        echo "############################################################"
+        cat "$HOME/{{ restart_banner_status_filename }}"
+        echo "############################################################"
+      fi
+  become: true
+  become_user: "{{ jvm_owner }}"
+
+- name: Write banner status file (shown on login)
+  copy:
+    dest: "{{ jvm_status_file }}"
+    mode: "0644"
+    content: |
+      WebSphere JVM restart IN PROGRESS
+      RITM: {{ ritm_number }}
+      Host: {{ inventory_hostname }}
+      Profile: {{ profile_name }}
+      JVM: {{ jvm_name }}
+      Please do not manually start/stop this JVM.
+  become: true
+  become_user: "{{ jvm_owner }}"
+
+- name: Track owners touched for cleanup
+  set_fact:
+    owners_touched: "{{ owners_touched | union([jvm_owner]) }}"
+5) Banner cleanup task: roles/websphere_jvm_restart/tasks/banner_cleanup.yml
+What it does
+
+For each owner touched on this host:
+
+Removes the status file (so banner stops showing)
+
+Removes the managed .profile block (so we leave the server unchanged)
+
+---
+- name: Cleanup banner artifacts for all owners touched
+  loop: "{{ owners_touched | default([]) }}"
+  loop_control:
+    loop_var: banner_owner
+  block:
+    - name: Determine home directory for {{ banner_owner }}
+      shell: "getent passwd {{ banner_owner }} | cut -d: -f6 || echo /home/{{ banner_owner }}"
+      register: _banner_home
+      changed_when: false
+      failed_when: false
+
+    - name: Remove status file
+      file:
+        path: "{{ (_banner_home.stdout | trim) ~ '/' ~ restart_banner_status_filename }}"
+        state: absent
+      become: true
+      become_user: "{{ banner_owner }}"
+
+    - name: Remove managed .profile banner block
+      blockinfile:
+        path: "{{ (_banner_home.stdout | trim) ~ '/' ~ restart_banner_profile_filename }}"
+        marker: "# {mark} {{ restart_banner_block_id }}"
+        state: absent
+      become: true
+      become_user: "{{ banner_owner }}"
+6) Per-JVM restart logic: roles/websphere_jvm_restart/tasks/restart_one.yml
+Key logic
+
+Determine jvm_owner + profile_bin via:
+
+ps match OR
+
+install root fallback
+
+Set banner (updates .profile + status file)
+
+Use serverStatus.sh -all to decide:
+
+STOPPED → start
+
+STARTED → stop with timeout
+
+poll ps -ef by PID until PID disappears (10 min)
+
+if not → kill -9 PID and poll until gone
+
+verify PID is gone → start
+
+Validate STARTED again with serverStatus.sh -all
+
+Append a jvm_result record with host_profile_jvm = "host:profile:jvm"
+
+---
+- name: Validate request fields
+  assert:
+    that:
+      - req.profile_name is defined
+      - req.jvm_name is defined
+      - (req.profile_name | length) > 0
+      - (req.jvm_name | length) > 0
+    fail_msg: "Invalid request on {{ inventory_hostname }}: {{ req }}"
+
+- name: Set request vars
+  set_fact:
+    profile_name: "{{ req.profile_name }}"
+    jvm_name: "{{ req.jvm_name }}"
+
+- name: Restart JVM with result capture
+  block:
+    # A) ps lookup
+    - name: Find JVM process (initial)
+      shell: "{{ restart_ps_cmd }}"
+      register: ps_before
+      changed_when: false
+      failed_when: false
+
+    - name: Pick matching ps line where last word is jvm_name
+      set_fact:
+        _matching_lines: >-
+          {{
+            ps_before.stdout_lines | default([])
+            | select('match', '.*\\s' ~ jvm_name ~ '$')
+            | list
+          }}
+
+    - name: If PID exists, parse owner/pid and derive profile_bin
+      when: (_matching_lines | length) > 0
+      block:
+        - set_fact:
+            _ps_words: "{{ _matching_lines[0].split() }}"
+        - set_fact:
+            jvm_owner: "{{ _ps_words[0] }}"
+            old_pid: "{{ _ps_words[1] }}"
+            detected_config_path: "{{ _ps_words[-4] }}"
+            detected_cell_name: "{{ _ps_words[-3] }}"
+            detected_profile_name: "{{ _ps_words[-2] }}"
+            detected_jvm_name: "{{ _ps_words[-1] }}"
+
+        - name: Validate profile/jvm from ps matches payload
+          assert:
+            that:
+              - detected_profile_name == profile_name
+              - detected_jvm_name == jvm_name
+
+        - name: Validate config path ends with /config
+          assert:
+            that:
+              - detected_config_path is match(".*\\/config$")
+
+        - set_fact:
+            profile_dir: "{{ detected_config_path | regex_replace('\\/config$', '') }}"
+            profile_bin: "{{ (detected_config_path | regex_replace('\\/config$', '')) ~ '/bin' }}"
+
+    # B) no PID -> install root fallback
+    - name: If no PID, find install root + owner + profile_dir
+      when: (_matching_lines | length) == 0
+      block:
+        - name: Check install roots
+          stat:
+            path: "{{ item }}"
+          register: _root_stats
+          loop: "{{ was_install_roots }}"
+
+        - name: Choose first existing install root
+          set_fact:
+            chosen_install_root: >-
+              {{
+                (_root_stats.results
+                  | selectattr('stat.exists','equalto',true)
+                  | map(attribute='item')
+                  | list
+                  | first) | default('')
+              }}
+
+        - name: Fail if no install root exists
+          assert:
+            that:
+              - chosen_install_root | length > 0
+            fail_msg: "No WebSphere install root found from list: {{ was_install_roots }}"
+
+        - name: Stat chosen root to get owner
+          stat:
+            path: "{{ chosen_install_root }}"
+          register: _chosen_root_stat
+
+        - name: Set owner and profile path from install root
+          set_fact:
+            jvm_owner: "{{ _chosen_root_stat.stat.pw_name | default('') }}"
+            old_pid: ""
+            detected_cell_name: "unknown"
+            profile_dir: "{{ (chosen_install_root | regex_replace('\\/$', '')) ~ '/profiles/' ~ profile_name }}"
+            profile_bin: "{{ (chosen_install_root | regex_replace('\\/$', '')) ~ '/profiles/' ~ profile_name ~ '/bin' }}"
+
+        - name: Fallback owner with ls if needed
+          when: (jvm_owner | length) == 0
+          block:
+            - shell: "ls -ld {{ chosen_install_root }} | awk '{print $3}'"
+              register: _root_owner
+              changed_when: false
+            - set_fact:
+                jvm_owner: "{{ _root_owner.stdout | trim }}"
+
+        - name: Validate profile directory exists
+          stat:
+            path: "{{ profile_dir }}"
+          register: _profile_stat
+
+        - name: Fail if profile path does not exist
+          assert:
+            that:
+              - _profile_stat.stat.exists
+            fail_msg: "Profile path not found: {{ profile_dir }}"
+
+    # === Banner: set/update while this JVM is being handled ===
+    - name: Set login banner for restart in progress
+      when: restart_banner_enabled | bool
+      include_tasks: banner_set.yml
+
+    # C) serverStatus detects state
+    - name: Run serverStatus.sh -all
+      shell: "{{ profile_bin }}/serverStatus.sh -all"
+      register: server_status
+      become: true
+      become_user: "{{ jvm_owner }}"
+      changed_when: false
+      failed_when: false
+
+    - name: Parse serverStatus for target JVM
+      set_fact:
+        ss_has_server: "{{ (server_status.stdout | default('') | regex_search('ADMU0506I: Server name:\\s*' ~ jvm_name)) is not none }}"
+        ss_started: "{{ (server_status.stdout | default('') | regex_search('ADMU0508I: The Application Server \"' ~ jvm_name ~ '\" is STARTED')) is not none }}"
+        ss_stopped: "{{ (server_status.stdout | default('') | regex_search('ADMU0509I: The Application Server \"' ~ jvm_name ~ '\" cannot be reached')) is not none }}"
+
+    - name: Ensure JVM is listed in serverStatus output
+      assert:
+        that:
+          - ss_has_server
+
+    # D) STOPPED -> start
+    - name: Start JVM when STOPPED
+      when: ss_stopped and (not ss_started)
+      block:
+        - set_fact: { action_taken: "start" }
+        - shell: "{{ profile_bin }}/startServer.sh {{ jvm_name }}"
+          become: true
+          become_user: "{{ jvm_owner }}"
+          changed_when: true
+
+    # D) STARTED -> stop with timeout, PID polling, kill -9, verify stopped, then start
+    - name: Restart JVM when STARTED (stop timeout + PID polling + kill -9)
+      when: ss_started
+      block:
+        - set_fact: { action_taken: "restart" }
+
+        - name: Capture PID for stop/kill
+          shell: "{{ restart_ps_cmd }}"
+          register: ps_for_kill
+          changed_when: false
+          failed_when: false
+
+        - name: Extract pid_to_kill from ps output
+          set_fact:
+            _kill_lines: "{{ (ps_for_kill.stdout_lines | default([])) | select('match', '.*\\s' ~ jvm_name ~ '$') | list }}"
+            pid_to_kill: "{{ (_kill_lines | length > 0) | ternary((_kill_lines[0].split()[1]), '') }}"
+
+        - name: Ensure PID is known for polling/kill
+          assert:
+            that:
+              - pid_to_kill | length > 0
+            fail_msg: "Cannot determine PID for {{ jvm_name }}; cannot enforce stop/kill rules."
+
+        - name: Stop server (async to avoid hang)
+          shell: "{{ profile_bin }}/stopServer.sh {{ jvm_name }}"
+          become: true
+          become_user: "{{ jvm_owner }}"
+          async: "{{ stop_timeout_seconds }}"
+          poll: 0
+          changed_when: true
+
+        - name: Wait up to {{ stop_timeout_seconds }}s for PID to disappear (ps polling)
+          block:
+            - name: Poll ps until PID disappears
+              shell: "ps -ef | awk '$2=={{ pid_to_kill }} {print}'"
+              register: ps_pid_check
+              become: true
+              become_user: "{{ jvm_owner }}"
+              changed_when: false
+              failed_when: false
+              retries: "{{ (stop_timeout_seconds // stop_check_delay) | int }}"
+              delay: "{{ stop_check_delay }}"
+              until: (ps_pid_check.stdout | default('') | trim) == ""
+          rescue:
+            - name: Force kill -9 the JVM PID
+              shell: "kill -9 {{ pid_to_kill }}"
+              become: true
+              become_user: "{{ jvm_owner }}"
+              changed_when: true
+              failed_when: false
+
+            - name: Poll ps until PID disappears after kill -9
+              shell: "ps -ef | awk '$2=={{ pid_to_kill }} {print}'"
+              register: ps_pid_check2
+              become: true
+              become_user: "{{ jvm_owner }}"
+              changed_when: false
+              failed_when: false
+              retries: 60
+              delay: 5
+              until: (ps_pid_check2.stdout | default('') | trim) == ""
+
+        - name: Final verify PID is gone before start
+          shell: "ps -ef | awk '$2=={{ pid_to_kill }} {print}'"
+          register: ps_final
+          become: true
+          become_user: "{{ jvm_owner }}"
+          changed_when: false
+          failed_when: false
+
+        - name: Assert PID is gone before start
+          assert:
+            that:
+              - (ps_final.stdout | default('') | trim) == ""
+            fail_msg: "PID {{ pid_to_kill }} still exists; will not attempt start."
+
+        - name: Start server after confirmed stop
+          shell: "{{ profile_bin }}/startServer.sh {{ jvm_name }}"
+          become: true
+          become_user: "{{ jvm_owner }}"
+          changed_when: true
+
+    # E) Post validation via serverStatus
+    - name: Wait until serverStatus shows JVM STARTED
+      shell: "{{ profile_bin }}/serverStatus.sh -all"
+      register: server_status_after
+      become: true
+      become_user: "{{ jvm_owner }}"
+      changed_when: false
+      failed_when: false
+      retries: "{{ restart_wait_retries }}"
+      delay: "{{ restart_wait_delay }}"
+      until: >
+        (server_status_after.stdout | default('') |
+          regex_search('ADMU0508I: The Application Server \"' ~ jvm_name ~ '\" is STARTED')
+        ) is not none
+
+    # F) ps after (best effort PID + cell)
+    - name: Capture ps after action (best effort)
+      shell: "{{ restart_ps_cmd }}"
+      register: ps_after
+      changed_when: false
+      failed_when: false
+
+    - name: Set new pid/cell if ps line exists (best effort)
+      set_fact:
+        _after_lines: "{{ (ps_after.stdout_lines | default([])) | select('match', '.*\\s' ~ jvm_name ~ '$') | list }}"
+        new_pid: "{{ (_after_lines | length > 0) | ternary((_after_lines[0].split()[1]), 'not found via ps') }}"
+        detected_cell_name: "{{ (_after_lines | length > 0) | ternary((_after_lines[0].split()[-3]), (detected_cell_name | default('unknown'))) }}"
+
+    - name: Build success result
+      set_fact:
+        jvm_result:
+          host: "{{ inventory_hostname }}"
+          profile_name: "{{ profile_name }}"
+          jvm_name: "{{ jvm_name }}"
+          host_profile_jvm: "{{ inventory_hostname ~ ':' ~ profile_name ~ ':' ~ jvm_name }}"
+          cell_name: "{{ detected_cell_name | default('unknown') }}"
+          profile_dir: "{{ profile_dir }}"
+          status: "success"
+          action: "{{ action_taken | default('unknown') }}"
+          old_pid: "{{ old_pid | default('') }}"
+          new_pid: "{{ new_pid }}"
+
+  rescue:
+    - name: Build failure result
+      set_fact:
+        jvm_result:
+          host: "{{ inventory_hostname }}"
+          profile_name: "{{ profile_name }}"
+          jvm_name: "{{ jvm_name }}"
+          host_profile_jvm: "{{ inventory_hostname ~ ':' ~ profile_name ~ ':' ~ jvm_name }}"
+          cell_name: "{{ detected_cell_name | default('unknown') }}"
+          profile_dir: "{{ profile_dir | default('unknown') }}"
+          status: "failed"
+          action: "{{ action_taken | default('unknown') }}"
+          old_pid: "{{ old_pid | default('') }}"
+          new_pid: ""
+          reason: >-
+            {{
+              (ansible_failed_result.msg
+                | default(ansible_failed_result.stderr)
+                | default('Unknown failure'))
+            }}
+
+  always:
+    - name: Append result to per-host results
+      set_fact:
+        jvm_results: "{{ jvm_results + [ jvm_result ] }}"
+7) ServiceNow update: roles/websphere_jvm_restart/tasks/snow_update.yml
+
+(One call only; includes failed_hosts list)
+
+---
+- name: Validate ServiceNow endpoint settings
+  assert:
+    that:
+      - snow_instance_url | length > 0
+      - snow_update_path | length > 0
+    fail_msg: "snow_instance_url and snow_update_path must be set."
+
+- name: Build headers for ServiceNow call
+  set_fact:
+    _snow_headers: >-
+      {{
+        {
+          'Accept': 'application/json',
+          'Content-Type': 'application/json'
+        }
+        | combine(
+            (snow_bearer_token | length > 0)
+            | ternary({'Authorization': 'Bearer ' ~ snow_bearer_token}, {})
+          )
+      }}
+
+- name: POST update to ServiceNow (ONE call)
+  uri:
+    url: "{{ snow_instance_url }}{{ snow_update_path }}"
+    method: POST
+    headers: "{{ _snow_headers }}"
+    body_format: json
+    body: "{{ snow_body_info }}"
+    validate_certs: "{{ snow_validate_certs }}"
+    force_basic_auth: "{{ (snow_user | length > 0) and (snow_password | length > 0) }}"
+    user: "{{ snow_user | default(omit) }}"
+    password: "{{ snow_password | default(omit) }}"
+    status_code: [200, 201, 202, 204]
+  no_log: true
+How the login banner behaves
+During execution
+
+When the role begins working on a JVM (after it determines jvm_owner), it:
+
+ensures ~jvm_owner/.profile prints the status file if present
+
+writes ~jvm_owner/.was_jvm_restart_status with:
+
+RITM, host, profile, JVM, “restart in progress”
+
+So anyone who logs in as jvm_owner will see a big banner.
+
+At end of host
+
+After all JVMs on that host are processed, the role:
+
+deletes ~jvm_owner/.was_jvm_restart_status
+
+removes the managed .profile block it inserted
+
+So the server is clean after automation finishes.
+
+If you want the banner to show for any user logging in (not just jvm_owner), the correct approach is motd/issue/SSHD banner—tell me which is allowed in your environment and I’ll adapt it.
