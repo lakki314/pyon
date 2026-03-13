@@ -1,0 +1,29 @@
+ctx="/myapp"
+
+cutoff=$(perl -MTime::Local -e '
+  @t = localtime(time);
+  $t[5]--;   # one year back
+  eval { $c = timelocal($t[0],$t[1],$t[2],$t[3],$t[4],$t[5]); };
+  if ($@) { $c = timelocal(0,0,0,1,$t[4],$t[5]); }   # rare fallback
+  print $c;
+')
+
+for f in /var/log/httpd/access_log*; do
+  case "$f" in
+    *.gz) gunzip -c "$f" ;;
+    *.Z)  zcat "$f" ;;
+    *)    cat "$f" ;;
+  esac
+done 2>/dev/null | CUTOFF="$cutoff" CTX="$ctx" perl -ne '
+BEGIN {
+  use Time::Local;
+  %mon = (Jan=>0,Feb=>1,Mar=>2,Apr=>3,May=>4,Jun=>5,Jul=>6,Aug=>7,Sep=>8,Oct=>9,Nov=>10,Dec=>11);
+  $cutoff = $ENV{"CUTOFF"};
+  $ctx    = $ENV{"CTX"};
+}
+next unless /"[A-Z]+ \Q$ctx\E(?:\/| |\?|")/;
+if (/\[([0-9]{2})\/([A-Za-z]{3})\/([0-9]{4}):([0-9]{2}):([0-9]{2}):([0-9]{2})/) {
+  $ts = timelocal($6,$5,$4,$1,$mon{$2},$3-1900);
+  $count++ if $ts >= $cutoff;
+}
+END { print $count+0, "\n"; }'
