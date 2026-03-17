@@ -1,0 +1,282 @@
+# roles/ihs_cert_deploy/tasks/fail_gate.yml
+---
+# FAST fail gate (STRICT):
+# - Any after_import.status == failed is a failure EVEN if after_restore succeeds
+# - host.status == unknown is also a failure
+# - Builds + publishes ihs_failed_hosts_map for retry node
+# - Fails job if any failures remain
+
+- name: ihs(fail-gate) | init tracking
+  set_fact:
+    __ihs_any_fail: false
+    __ihs_fail_pairs: []
+    __ihs_failed_hosts_map: {}
+  run_once: true
+  delegate_to: localhost
+
+- name: ihs(fail-gate) | build compact IHS cert entries (with ihs_deploy.hosts only)
+  set_fact:
+    __ihs_failgate_certs: >-
+      {{
+        (venafi_cert_plan | default({}) | dict2items)
+        | selectattr('value.cert_app_config_name','defined')
+        | selectattr('value.cert_app_config_name','lower')
+        | selectattr('value.cert_app_config_name','equalto','ihs')
+        | selectattr('value.ihs_deploy','defined')
+        | selectattr('value.ihs_deploy.hosts','defined')
+        | list
+      }}
+  run_once: true
+  delegate_to: localhost
+
+- name: ihs(fail-gate) | evaluate each IHS cert (per-cert include)
+  include_tasks: fail_gate_per_cert.yml
+  loop: "{{ __ihs_failgate_certs | default([]) }}"
+  loop_control:
+    loop_var: fg_cert_entry
+    label: "{{ fg_cert_entry.key }}"
+  vars:
+    fg_cert: "{{ fg_cert_entry.key }}"
+    __fg_host_map: "{{ fg_cert_entry.value.get('ihs_deploy', {}).get('hosts', {}) }}"
+  when:
+    - (fg_cert | string | length) > 0
+    - (__fg_host_map is mapping) and ((__fg_host_map | length) > 0)
+  run_once: true
+  delegate_to: localhost
+
+- name: ihs(fail-gate) | debug summary
+  debug:
+    msg:
+      - "ihs_any_fail={{ __ihs_any_fail | bool }}"
+      - "failed_pairs_count={{ (__ihs_fail_pairs | default([]) | unique | length) }}"
+      - "failed_hosts_map={{ __ihs_failed_hosts_map | default({}) }}"
+  run_once: true
+  delegate_to: localhost
+
+- name: ihs(fail-gate) | publish failed hosts map (workflow artifacts)
+  set_stats:
+    data:
+      ihs_failed_hosts_map: "{{ __ihs_failed_hosts_map | default({}) }}"
+    aggregate: true
+  when: (__ihs_failed_hosts_map | default({}) | length) > 0
+  run_once: true
+  delegate_to: localhost
+
+- name: ihs(fail-gate) | fail job if any IHS host failed
+  when: __ihs_any_fail | bool
+  fail:
+    msg: >-
+      IHS deployment validation has failures.
+      Failed entries={{ (__ihs_fail_pairs | default([])) | unique | list }}
+  run_once: true
+  delegate_to: localhost
+# roles/ihs_cert_deploy/tasks/fail_gate_per_cert.yml
+---
+# STRICT per-cert evaluation:
+# - after_import.status == failed => FAIL (even if restore succeeds)
+# - host.status == unknown        => FAIL
+#
+# Inputs:
+#   fg_cert
+#   __fg_host_map
+#
+# Outputs:
+#   __ihs_any_fail, __ihs_fail_pairs, __ihs_failed_hosts_map
+
+- name: ihs(fail-gate) | evaluate hosts for cert (strict)
+  vars:
+    __fg_host_name: "{{ fg_host_entry.key }}"
+    __fg_host_obj: "{{ fg_host_entry.value }}"
+    __fg_host_status: "{{ __fg_host_obj.get('status','') | string }}"
+
+    __fg_val: "{{ (__fg_host_obj.get('validation', {})) if (__fg_host_obj.get('validation') is mapping) else {} }}"
+
+    # after_import extraction (nested or stage object)
+    __fg_ai: >-
+      {{
+        __fg_val.get('after_import')
+        if (__fg_val.get('after_import') is mapping)
+        else
+          (
+            __fg_val
+            if ((__fg_val.get('stage','') | string) == 'after_import')
+            else {}
+          )
+      }}
+    __fg_ai_status: "{{ (__fg_ai.get('status','') | string) }}"
+
+    __fg_final_fail: "{{ (__fg_host_status | lower) == 'unknown' or (__fg_ai_status | lower) == 'failed' }}"
+  loop: "{{ (__fg_host_map | dict2items) }}"
+  loop_control:
+    loop_var: fg_host_entry
+    label: "{{ fg_cert }} -> {{ fg_host_entry.key }}"
+  when: __fg_final_fail | bool
+  block:
+    - name: ihs(fail-gate) | record failure pair + failed-host map
+      set_fact:
+        __ihs_any_fail: true
+        __ihs_fail_pairs: "{{ (__ihs_fail_pairs | default([])) + [ fg_cert ~ ' -> ' ~ (__fg_host_name | string) ] }}"
+        __ihs_failed_hosts_map: >-
+          {{
+            (__ihs_failed_hosts_map | default({}))
+            | combine(
+                {
+                  (fg_cert): (
+                    ((__ihs_failed_hosts_map | default({})).get(fg_cert, []) | default([]))
+                    + [ (__fg_host_name | string) ]
+                  ) | unique | list
+                },
+                recursive=True
+              )
+          }}
+      delegate_to: localhost
+      run_once: true
+# roles/ihs_cert_deploy/tasks/retry.yml
+---
+# FAST retry (uses ihs_failed_hosts_map):
+# - Prefer ihs_failed_hosts_map from workflow artifacts (set_stats)
+# - Fallback to __ihs_failed_hosts_map if present in same run
+# - Retries sequentially: cert-by-cert, then host-by-host
+#
+# Requires deploy_host.yml to exist (per-host executor)
+
+- name: ihs(retry) | choose failed-host map source
+  set_fact:
+    __ihs_retry_map: >-
+      {{
+        (ihs_failed_hosts_map | default({}))
+        if ((ihs_failed_hosts_map is defined) and (ihs_failed_hosts_map | length > 0))
+        else
+          (__ihs_failed_hosts_map | default({}))
+      }}
+  run_once: true
+  delegate_to: localhost
+
+- name: ihs(retry) | debug retry map
+  debug:
+    msg:
+      - "ihs_failed_hosts_map={{ __ihs_retry_map | default({}) }}"
+      - "retry_certs={{ __ihs_retry_map.keys() | list if (__ihs_retry_map | length > 0) else [] }}"
+  run_once: true
+  delegate_to: localhost
+
+- name: ihs(retry) | assert something to retry
+  assert:
+    that:
+      - (__ihs_retry_map | default({}) | length) > 0
+    fail_msg: "ihs(retry): no failed hosts found (ihs_failed_hosts_map is empty)."
+  run_once: true
+  delegate_to: localhost
+
+- name: ihs(retry) | build retry cert list
+  set_fact:
+    __ihs_retry_certs: "{{ __ihs_retry_map.keys() | list }}"
+  run_once: true
+  delegate_to: localhost
+
+- name: ihs(retry) | retry per cert (sequential)
+  include_tasks: retry_per_cert.yml
+  loop: "{{ __ihs_retry_certs }}"
+  loop_control:
+    loop_var: retry_cert
+    label: "{{ retry_cert }}"
+  vars:
+    __retry_hosts: "{{ __ihs_retry_map.get(retry_cert, []) | default([]) }}"
+    __retry_conf: "{{ venafi_cert_plan.get(retry_cert, {}).get('cert_app_config','') | string }}"
+    __retry_expected_serial: "{{ venafi_cert_plan.get(retry_cert, {}).get('renew', {}).get('renewed_serial','') | string }}"
+  run_once: true
+  delegate_to: localhost
+  tags: [retry]
+# roles/ihs_cert_deploy/tasks/retry_per_cert.yml
+---
+# Per-cert retry helper.
+# Inputs:
+#   retry_cert
+#   __retry_hosts
+#   __retry_conf
+#   __retry_expected_serial
+
+- name: ihs(retry) | assert hosts exist for cert
+  assert:
+    that:
+      - (__retry_hosts | default([]) | length) > 0
+    fail_msg: "ihs(retry): no hosts listed to retry for cert={{ retry_cert }}"
+  delegate_to: localhost
+  run_once: true
+
+- name: ihs(retry) | retry hosts for cert sequentially
+  loop: "{{ __retry_hosts }}"
+  loop_control:
+    loop_var: retry_host
+    label: "{{ retry_cert }} -> {{ retry_host }}"
+  include_tasks: deploy_host.yml
+  vars:
+    ihs_cert: "{{ retry_cert }}"
+    ihs_host: "{{ retry_host }}"
+    ihs_httpd_conf: "{{ __retry_conf }}"
+    ihs_expected_serial: "{{ __retry_expected_serial }}"
+  delegate_to: localhost
+  run_once: true
+  tags: [retry]
+give me main.yml for this role
+
+# roles/ihs_cert_deploy/tasks/main.yml
+---
+# IHS Cert Deploy Role - entrypoint
+#
+# Tags:
+#   deploy -> plan-driven deploy (all eligible IHS certs/hosts)
+#   retry  -> retry only failed hosts using ihs_failed_hosts_map + also runs report
+#   report -> send report only (or included automatically with retry)
+#
+# Order:
+# - deploy run:  deploy -> report -> fail_gate
+# - retry run:   retry  -> report -> fail_gate
+#
+# Notes:
+# - fail_gate always runs after report so the report is sent even when failing.
+# - fail_gate publishes ihs_failed_hosts_map for AWX workflow retry node.
+
+- name: ihs | assert venafi_cert_plan present
+  assert:
+    that:
+      - venafi_cert_plan is defined
+      - (venafi_cert_plan | length) > 0
+    fail_msg: "ihs_cert_deploy requires venafi_cert_plan artifacts."
+  run_once: true
+  delegate_to: localhost
+  tags: [deploy, retry, report]
+
+# -------------------------------------------------------------------
+# DEPLOY (plan-driven)
+# -------------------------------------------------------------------
+- name: ihs | deploy from plan
+  import_tasks: deploy_from_plan.yml
+  tags: [deploy]
+
+# -------------------------------------------------------------------
+# RETRY (failed hosts only)
+# -------------------------------------------------------------------
+- name: ihs | retry failed hosts
+  import_tasks: retry.yml
+  tags: [retry]
+
+# -------------------------------------------------------------------
+# REPORT
+# - Runs when tag report is chosen
+# - Also runs automatically with retry
+# -------------------------------------------------------------------
+- name: ihs | reporting (email)
+  import_tasks: report.yml
+  tags: [report, retry]
+
+# -------------------------------------------------------------------
+# FAIL GATE (STRICT)
+# - after_import.status=failed is ALWAYS a failure (even if restore succeeds)
+# - host.status=unknown is also a failure
+# - publishes ihs_failed_hosts_map for AWX workflow retry node
+# - fails job if any failures remain
+# -------------------------------------------------------------------
+- name: ihs | overall failure gate (strict)
+  import_tasks: fail_gate.yml
+  tags: [deploy, retry]
