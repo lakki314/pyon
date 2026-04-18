@@ -1,0 +1,195 @@
+Below is the updated router playbook + updated websphere_jvm_restart role with the performance improvements you asked for:
+✅ Faster performance changes added
+
+
+Cache install root once per host (only if needed)
+
+
+Batch by profile: run serverStatus.sh -all once per profile before actions and once after (with a single wait loop)
+
+
+Banner once per host/owner (not per JVM)
+
+
+Still keeps safety: stop timeout (10 min) → kill -9 → poll PID disappearance using ps -ef
+
+
+Results are still aggregated and posted once to ServiceNow.
+
+
+
+1) File structure
+playbooks/  auto_router.ymlroles/  websphere_jvm_restart/    defaults/      main.yml    tasks/      build_inventory.yml      build_one_env.yml      build_one_host.yml      append_profile_jvms.yml      execute_on_host.yml      restart_profile.yml      restart_started_jvm.yml      banner_set_host.yml      banner_cleanup.yml      aggregate_and_notify.yml      snow_update.yml
+
+2) Router playbook (runs only the role matching the payload)
+playbooks/auto_router.yml
+---- name: Detect payload and build inventory for selected automation  hosts: localhost  gather_facts: false  vars:    role_registry:      - payload_var: "jvm_restart"        role_name: "websphere_jvm_restart"        group_prefix: "wsjvm_restart_targets"      # ---- FUTURE EXAMPLE (commented) ----      # - payload_var: "ihs_restart"      #   role_name: "ihs_restart_role"      #   group_prefix: "ihs_restart_targets"  tasks:    - name: Find which payloads are defined at launch      set_fact:        matched_specs: >-          {{            role_registry            | selectattr('payload_var', 'in', vars.keys() | list)            | list          }}    - name: Validate exactly one supported payload is provided      assert:        that:          - matched_specs | length == 1        fail_msg: >-          Expected exactly ONE supported payload at launch.          Supported: {{ role_registry | map(attribute='payload_var') | list }}          Received: {{            (role_registry | map(attribute='payload_var') | list)            | select('in', vars.keys() | list)            | list          }}    - name: Select role spec      set_fact:        selected_payload_var_name: "{{ matched_specs[0].payload_var }}"        selected_role_name: "{{ matched_specs[0].role_name }}"        selected_group_prefix: "{{ matched_specs[0].group_prefix }}"    - name: Build dynamic inventory for selected role      include_role:        name: "{{ selected_role_name }}"        tasks_from: build_inventory.yml      vars:        role_payload_var_name: "{{ selected_payload_var_name }}"        role_group_prefix: "{{ selected_group_prefix }}"- name: Execute selected role on dynamic hosts (parallel per host)  hosts: all  gather_facts: false  strategy: free  vars:    selected_role_name: "{{ hostvars['localhost'].selected_role_name }}"    selected_payload_var_name: "{{ hostvars['localhost'].selected_payload_var_name }}"    selected_group_prefix: "{{ hostvars['localhost'].selected_group_prefix }}"  tasks:    - name: Execute selected role on hosts that belong to its groups      include_role:        name: "{{ selected_role_name }}"        tasks_from: execute_on_host.yml      vars:        role_payload_var_name: "{{ selected_payload_var_name }}"        role_group_prefix: "{{ selected_group_prefix }}"      when: >        (group_names | select('match', '^' ~ (selected_group_prefix | regex_escape) ~ '_') | list | length) > 0- name: Aggregate results and notify ServiceNow (selected role only)  hosts: localhost  gather_facts: false  vars:    selected_role_name: "{{ hostvars['localhost'].selected_role_name }}"    selected_payload_var_name: "{{ hostvars['localhost'].selected_payload_var_name }}"    selected_group_prefix: "{{ hostvars['localhost'].selected_group_prefix }}"  tasks:    - name: Aggregate and notify for selected role      include_role:        name: "{{ selected_role_name }}"        tasks_from: aggregate_and_notify.yml      vars:        role_payload_var_name: "{{ selected_payload_var_name }}"        role_group_prefix: "{{ selected_group_prefix }}"
+How “different env” works here
+
+
+The role creates groups like wsjvm_restart_targets_dev, wsjvm_restart_targets_prod
+
+
+The execute play runs on hosts: all, but only hosts in those groups pass the when: condition.
+
+
+
+3) Role: websphere_jvm_restart (FULL)
+3.1 Defaults
+roles/websphere_jvm_restart/defaults/main.yml
+---role_payload_var_name: "jvm_restart"role_group_prefix: "wsjvm_restart_targets"restart_ps_cmd: "ps -ef | grep java | grep {{ jvm_name }} | grep -v grep"restart_wait_retries: 30restart_wait_delay: 10stop_timeout_seconds: 600stop_check_delay: 15was_install_roots:  - "/opt/wps8/websphere/AppServer/85/"  - "/opt/websphere/85/commonprofile/AppServer"  - "/opt/websphere/90/commonprofile/AppServer"  - "/opt/websphere/85/AppServer/"# Faster banner: set once per host/ownerrestart_banner_enabled: truerestart_banner_status_filename: ".was_jvm_restart_status"restart_banner_profile_filename: ".profile"restart_banner_block_id: "ANSIBLE MANAGED - WAS JVM RESTART BANNER"snow_instance_url: ""snow_update_path: ""snow_validate_certs: truesnow_user: ""snow_password: ""snow_bearer_token: ""
+
+3.2 Inventory build tasks (same behavior, readable)
+roles/websphere_jvm_restart/tasks/build_inventory.yml
+---- name: Load payload  set_fact:    ws_payload: "{{ vars[role_payload_var_name] | default({}) }}"- name: Validate payload exists  assert:    that:      - ws_payload is mapping      - ws_payload | length > 0    fail_msg: "Payload var '{{ role_payload_var_name }}' is missing or empty."- name: Extract ritm_number  set_fact:    ritm_number: >-      {{        ws_payload.get('ritm_number')        or ws_payload.get('RITM number')        or ws_payload.get('ritmNumber')      }}- name: Validate ritm_number  assert:    that:      - ritm_number is defined      - ritm_number | length > 0    fail_msg: "ritm_number is missing in '{{ role_payload_var_name }}'."- name: Extract envs map  set_fact:    envs_map: "{{ ws_payload.get('envs', {}) }}"- name: Validate envs map  assert:    that:      - envs_map is mapping      - envs_map | length > 0    fail_msg: "payload.envs is missing/empty in '{{ role_payload_var_name }}'."- name: Convert envs map to list  set_fact:    env_specs: "{{ envs_map | dict2items }}"- name: Build dynamic inventory per env  include_tasks: build_one_env.yml  loop: "{{ env_specs }}"  loop_control:    loop_var: env_spec    label: "{{ env_spec.key }}"
+roles/websphere_jvm_restart/tasks/build_one_env.yml
+---- name: Set env context  set_fact:    env_name: "{{ env_spec.key }}"    env_hosts_map: "{{ env_spec.value.get('hosts', {}) }}"- name: Validate env hosts  assert:    that:      - env_hosts_map is mapping      - env_hosts_map | length > 0    fail_msg: "No hosts under env {{ env_name }}."- name: Convert host map to list  set_fact:    host_specs: "{{ env_hosts_map | dict2items }}"- name: Build inventory entries per host  include_tasks: build_one_host.yml  loop: "{{ host_specs }}"  loop_control:    loop_var: host_spec    label: "{{ env_name }} -> {{ host_spec.key }}"
+roles/websphere_jvm_restart/tasks/build_one_host.yml
+---- name: Initialize restart_requests  set_fact:    restart_requests: []- name: Convert profiles map to list  set_fact:    profile_specs: "{{ host_spec.value | dict2items }}"- name: Append profile/jvm pairs  include_tasks: append_profile_jvms.yml  loop: "{{ profile_specs }}"  loop_control:    loop_var: profile_spec    label: "{{ env_name }} -> {{ host_spec.key }} -> {{ profile_spec.key }}"- name: Add host to dynamic group  add_host:    name: "{{ host_spec.key }}"    groups: "{{ role_group_prefix }}_{{ env_name }}"    ritm_number: "{{ ritm_number }}"    env_name: "{{ env_name }}"    restart_requests: "{{ restart_requests }}"
+roles/websphere_jvm_restart/tasks/append_profile_jvms.yml
+---- name: Append JVMs for this profile  set_fact:    restart_requests: "{{ restart_requests + [ {'profile_name': profile_spec.key, 'jvm_name': jvm_name_entry} ] }}"  loop: "{{ profile_spec.value | default([]) }}"  loop_control:    loop_var: jvm_name_entry    label: "{{ profile_spec.key }} -> {{ jvm_name_entry }}"
+
+3.3 Execute phase (FAST version)
+roles/websphere_jvm_restart/tasks/execute_on_host.yml
+What changed for performance
+
+
+Cache install root once per host (only used when PID not found)
+
+
+Group work by profile:
+
+
+serverStatus.sh -all is run once per profile BEFORE and once AFTER (with one wait loop)
+
+
+
+
+Banner is set once per host/owner (not per JVM)
+
+
+---- name: Initialize per-host tracking  set_fact:    jvm_results: "{{ jvm_results | default([]) }}"    owners_touched: "{{ owners_touched | default([]) }}"    cached_install_root: "{{ cached_install_root | default('') }}"    cached_install_owner: "{{ cached_install_owner | default('') }}"- name: Validate restart_requests exist  assert:    that:      - restart_requests is defined      - restart_requests is sequence      - restart_requests | length > 0    fail_msg: "No restart_requests on {{ inventory_hostname }}."# ---- Cache install root once per host (used only when PID not found) ----- name: Check install roots once per host  stat:    path: "{{ install_root }}"  loop: "{{ was_install_roots }}"  loop_control:    loop_var: install_root  register: install_root_stats- name: Select first existing install root  set_fact:    cached_install_root: >-      {{        (install_root_stats.results          | selectattr('stat.exists','equalto',true)          | map(attribute='install_root')          | list          | first) | default('')      }}- name: Get install root owner (if root exists)  when: cached_install_root | length > 0  stat:    path: "{{ cached_install_root }}"  register: cached_root_stat- name: Save cached install owner (fallback to ls if needed)  when: cached_install_root | length > 0  block:    - set_fact:        cached_install_owner: "{{ cached_root_stat.stat.pw_name | default('') }}"    - when: cached_install_owner | length == 0      block:        - shell: "ls -ld {{ cached_install_root }} | awk '{print $3}'"          register: cached_owner_cmd          changed_when: false        - set_fact:            cached_install_owner: "{{ cached_owner_cmd.stdout | trim }}"# ---- Group requests by profile (serverStatus per profile, not per JVM) ----- name: Initialize profile_map  set_fact:    profile_map: {}- name: Build profile_map {profile_name: [jvm1,jvm2,...]}  set_fact:    profile_map: >-      {{        profile_map        | combine({ req_profile: (profile_map.get(req_profile, []) + [req_jvm]) })      }}  vars:    req_profile: "{{ req_entry.profile_name }}"    req_jvm: "{{ req_entry.jvm_name }}"  loop: "{{ restart_requests }}"  loop_control:    loop_var: req_entry    label: "{{ req_entry.profile_name }} -> {{ req_entry.jvm_name }}"- name: Convert profile_map to list  set_fact:    profile_specs: "{{ profile_map | dict2items }}"# ---- Process each profile sequentially (but host still parallel to other hosts) ----- name: Process profiles on this host  block:    - name: Restart JVMs for one profile (batched serverStatus)      include_tasks: restart_profile.yml      loop: "{{ profile_specs }}"      loop_control:        loop_var: profile_spec        label: "{{ env_name | default('na') }}:{{ inventory_hostname }} -> {{ profile_spec.key }} ({{ profile_spec.value | length }} JVMs)"  always:    - name: Cleanup banners (always)      include_tasks: banner_cleanup.yml      when: restart_banner_enabled | bool
+
+roles/websphere_jvm_restart/tasks/restart_profile.yml
+What this does
+For ONE profile on ONE host:
+
+
+Determine profile_bin + jvm_owner efficiently:
+
+
+Try ps on JVMs until one is found (cheap loops)
+
+
+If none running → use cached install root path mapping: <root>/profiles/<profile>
+
+
+
+
+Set banner once per owner
+
+
+Run serverStatus.sh -all once (pre)
+
+
+Start STOPPED JVMs; restart STARTED JVMs (stop/kill/poll/start)
+
+
+Run serverStatus.sh -all once in a wait loop until all JVMs are STARTED (post)
+
+
+Record results for each JVM (success/failure)
+
+
+Capture PID/cell via ps best-effort (only once per JVM after completion)
+
+
+---- name: Set profile vars for this batch  set_fact:    profile_name: "{{ profile_spec.key }}"    profile_jvms: "{{ profile_spec.value | default([]) }}"- name: Validate JVM list for profile  assert:    that:      - profile_jvms is sequence      - profile_jvms | length > 0    fail_msg: "No JVMs provided for profile {{ profile_name }} on {{ inventory_hostname }}."# --- Find a running JVM among the list to derive owner/path quickly ---- name: Initialize ps_discovery variables  set_fact:    ps_found: false    ps_words: []    derived_from_ps: false- name: Try ps discovery for JVMs (stop early when found)  shell: "ps -ef | grep java | grep {{ discover_jvm }} | grep -v grep"  register: ps_discover_cmd  changed_when: false  failed_when: false  loop: "{{ profile_jvms }}"  loop_control:    loop_var: discover_jvm    label: "{{ profile_name }} -> ps check {{ discover_jvm }}"  when: not ps_found  ignore_errors: true- name: Pick first matching ps line that ends with a JVM name in this profile  set_fact:    ps_discover_lines: >-      {{        (ps_discover_cmd.results | default([]))        | map(attribute='stdout_lines')        | list        | flatten        | select('match', '.*\\s(' ~ (profile_jvms | map('regex_escape') | join('|')) ~ ')$')        | list      }}    ps_found: "{{ (ps_discover_lines | length) > 0 }}"- name: If ps found, parse owner/pid/profile path rule (last 4 words)  when: ps_found  block:    - set_fact:        ps_words: "{{ ps_discover_lines[0].split() }}"        jvm_owner: "{{ ps_words[0] }}"        detected_config_path: "{{ ps_words[-4] }}"        detected_cell_name: "{{ ps_words[-3] }}"        detected_profile_name: "{{ ps_words[-2] }}"        derived_from_ps: true    - name: Validate profile name from ps matches current profile      assert:        that:          - detected_profile_name == profile_name        fail_msg: "ps-derived profile {{ detected_profile_name }} does not match payload profile {{ profile_name }}."    - set_fact:        profile_dir: "{{ detected_config_path | regex_replace('\\/config$', '') }}"        profile_bin: "{{ (detected_config_path | regex_replace('\\/config$', '')) ~ '/bin' }}"- name: If no ps found, derive profile paths from cached install root  when: not ps_found  block:    - name: Ensure cached install root exists      assert:        that:          - cached_install_root | length > 0        fail_msg: "No running JVM found and no WebSphere install root found on {{ inventory_hostname }}."    - set_fact:        jvm_owner: "{{ cached_install_owner }}"        detected_cell_name: "unknown"        profile_dir: "{{ (cached_install_root | regex_replace('\\/$', '')) ~ '/profiles/' ~ profile_name }}"        profile_bin: "{{ (cached_install_root | regex_replace('\\/$', '')) ~ '/profiles/' ~ profile_name ~ '/bin' }}"    - name: Validate profile_dir exists      stat:        path: "{{ profile_dir }}"      register: profile_dir_stat    - assert:        that:          - profile_dir_stat.stat.exists        fail_msg: "Profile path not found: {{ profile_dir }}"# --- Banner ONCE per owner (not per JVM) ---- name: Set host banner once for this owner  when: restart_banner_enabled | bool  include_tasks: banner_set_host.yml  vars:    banner_owner: "{{ jvm_owner }}"    banner_summary: >-      WebSphere JVM restart IN PROGRESS      RITM: {{ ritm_number }}      ENV: {{ env_name | default('na') }}      Host: {{ inventory_hostname }}      Profile: {{ profile_name }}      JVMs: {{ profile_jvms | join(', ') }}# --- serverStatus once BEFORE ---- name: Run serverStatus.sh -all (pre)  shell: "{{ profile_bin }}/serverStatus.sh -all"  register: server_status_pre  become: true  become_user: "{{ jvm_owner }}"  changed_when: false  failed_when: false# Decide per JVM state from PRE status- name: Build state lists from pre serverStatus  set_fact:    jvms_started_pre: "{{ jvms_started_pre | default([]) }}"    jvms_stopped_pre: "{{ jvms_stopped_pre | default([]) }}"  no_log: true- name: Classify JVMs based on pre serverStatus  set_fact:    jvms_started_pre: "{{ jvms_started_pre + ([one_jvm] if started_hit else []) }}"    jvms_stopped_pre: "{{ jvms_stopped_pre + ([one_jvm] if stopped_hit else []) }}"  vars:    started_hit: "{{ (server_status_pre.stdout | default('') | regex_search('ADMU0508I: The Application Server \"' ~ (one_jvm | regex_escape) ~ '\" is STARTED')) is not none }}"    stopped_hit: "{{ (server_status_pre.stdout | default('') | regex_search('ADMU0509I: The Application Server \"' ~ (one_jvm | regex_escape) ~ '\" cannot be reached')) is not none }}"  loop: "{{ profile_jvms }}"  loop_control:    loop_var: one_jvm    label: "{{ profile_name }} -> classify {{ one_jvm }}"- name: Ensure all JVMs are present in serverStatus output  assert:    that:      - (jvms_started_pre | length) + (jvms_stopped_pre | length) == (profile_jvms | length)    fail_msg: >-      Some JVMs were not found or not classifiable in serverStatus output for profile {{ profile_name }}.      Check naming or profile path.# --- Actions: STOPPED -> start (fast) ---- name: Start STOPPED JVMs  shell: "{{ profile_bin }}/startServer.sh {{ stopped_jvm }}"  become: true  become_user: "{{ jvm_owner }}"  changed_when: true  loop: "{{ jvms_stopped_pre }}"  loop_control:    loop_var: stopped_jvm    label: "{{ profile_name }} -> start {{ stopped_jvm }}"# --- Actions: STARTED -> restart with safe stop/kill/poll/start ---- name: Restart STARTED JVMs safely (stop timeout + kill -9 + PID poll)  include_tasks: restart_started_jvm.yml  loop: "{{ jvms_started_pre }}"  loop_control:    loop_var: started_jvm    label: "{{ profile_name }} -> restart {{ started_jvm }}"  vars:    jvm_owner_for_restart: "{{ jvm_owner }}"    profile_bin_for_restart: "{{ profile_bin }}"# --- serverStatus once AFTER with a single wait condition for ALL JVMs ---- name: Wait until all JVMs in this profile are STARTED (post)  shell: "{{ profile_bin }}/serverStatus.sh -all"  register: server_status_post  become: true  become_user: "{{ jvm_owner }}"  changed_when: false  failed_when: false  retries: "{{ restart_wait_retries }}"  delay: "{{ restart_wait_delay }}"  until: >-    {{      profile_jvms      | map('regex_escape')      | map('regex_replace', '^(.*)$', 'ADMU0508I: The Application Server \"\\1\" is STARTED')      | map('regex_search', server_status_post.stdout | default(''))      | select('!=', None)      | list      | length      == (profile_jvms | length)    }}# --- Record results for each JVM (success if STARTED in post status) ---- name: Record results for each JVM in this profile  block:    - name: Best-effort ps for pid/cell      shell: "ps -ef | grep java | grep {{ result_jvm }} | grep -v grep"      register: ps_after_jvm      changed_when: false      failed_when: false    - name: Extract pid/cell best-effort      set_fact:        ps_lines: "{{ ps_after_jvm.stdout_lines | default([]) | select('match', '.*\\s' ~ (result_jvm | regex_escape) ~ '$') | list }}"        new_pid: "{{ (ps_lines | length > 0) | ternary((ps_lines[0].split()[1]), 'not found via ps') }}"        cell_name: "{{ (ps_lines | length > 0) | ternary((ps_lines[0].split()[-3]), (detected_cell_name | default('unknown'))) }}"        started_ok: "{{ (server_status_post.stdout | default('') | regex_search('ADMU0508I: The Application Server \"' ~ (result_jvm | regex_escape) ~ '\" is STARTED')) is not none }}"    - name: Append per-JVM result      set_fact:        jvm_results: >-          {{            jvm_results + [              {                'env_name': (env_name | default('na')),                'env_host_profile_jvm': ((env_name | default('na')) ~ ':' ~ inventory_hostname ~ ':' ~ profile_name ~ ':' ~ result_jvm),                'status': ( 'success' if started_ok else 'failed' ),                'profile_dir': (profile_dir | default('unknown')),                'cell_name': (cell_name | default('unknown')),                'new_pid': (new_pid | default('')),                'action': ( 'restart' if (result_jvm in jvms_started_pre) else 'start' ),                'reason': ( '' if started_ok else 'Not STARTED after operations (post serverStatus)' )              }            ]          }}  loop: "{{ profile_jvms }}"  loop_control:    loop_var: result_jvm    label: "{{ profile_name }} -> result {{ result_jvm }}"
+
+roles/websphere_jvm_restart/tasks/restart_started_jvm.yml
+This is the safe “restart” logic for a JVM that was STARTED:
+
+
+stopServer async (won’t hang)
+
+
+poll PID disappearance using ps -ef (awk by PID)
+
+
+if still present after 10 min → kill -9 → poll again
+
+
+verify PID gone → startServer
+
+
+---- name: Capture PID for stop/kill  shell: "ps -ef | grep java | grep {{ started_jvm }} | grep -v grep"  register: ps_for_kill  changed_when: false  failed_when: false- name: Extract pid_to_kill  set_fact:    kill_lines: "{{ ps_for_kill.stdout_lines | default([]) | select('match', '.*\\s' ~ (started_jvm | regex_escape) ~ '$') | list }}"    pid_to_kill: "{{ (kill_lines | length > 0) | ternary((kill_lines[0].split()[1]), '') }}"- name: Ensure PID is known for polling/kill  assert:    that:      - pid_to_kill | length > 0    fail_msg: "Cannot determine PID for {{ started_jvm }}; cannot enforce stop/kill."- name: Stop server (async)  shell: "{{ profile_bin_for_restart }}/stopServer.sh {{ started_jvm }}"  become: true  become_user: "{{ jvm_owner_for_restart }}"  async: "{{ stop_timeout_seconds }}"  poll: 0  changed_when: true- name: Wait up to timeout for PID to disappear (ps polling)  block:    - name: Poll ps until PID disappears      shell: "ps -ef | awk '$2=={{ pid_to_kill }} {print}'"      register: pid_poll      become: true      become_user: "{{ jvm_owner_for_restart }}"      changed_when: false      failed_when: false      retries: "{{ (stop_timeout_seconds // stop_check_delay) | int }}"      delay: "{{ stop_check_delay }}"      until: (pid_poll.stdout | default('') | trim) == ""  rescue:    - name: Kill -9 PID if still present      shell: "kill -9 {{ pid_to_kill }}"      become: true      become_user: "{{ jvm_owner_for_restart }}"      changed_when: true      failed_when: false    - name: Poll until PID disappears after kill -9      shell: "ps -ef | awk '$2=={{ pid_to_kill }} {print}'"      register: pid_poll_after_kill      become: true      become_user: "{{ jvm_owner_for_restart }}"      changed_when: false      failed_when: false      retries: 60      delay: 5      until: (pid_poll_after_kill.stdout | default('') | trim) == ""- name: Final verify PID is gone before start  shell: "ps -ef | awk '$2=={{ pid_to_kill }} {print}'"  register: pid_final_check  become: true  become_user: "{{ jvm_owner_for_restart }}"  changed_when: false  failed_when: false- name: Assert PID is gone  assert:    that:      - (pid_final_check.stdout | default('') | trim) == ""    fail_msg: "PID {{ pid_to_kill }} still exists; will not start {{ started_jvm }}."- name: Start server after confirmed stop  shell: "{{ profile_bin_for_restart }}/startServer.sh {{ started_jvm }}"  become: true  become_user: "{{ jvm_owner_for_restart }}"  changed_when: true
+
+Banner tasks (host-level, once per owner)
+roles/websphere_jvm_restart/tasks/banner_set_host.yml
+---- name: Determine banner owner home directory  shell: "getent passwd {{ banner_owner }} | cut -d: -f6 || echo /home/{{ banner_owner }}"  register: banner_owner_home_cmd  changed_when: false  failed_when: false- name: Set banner paths  set_fact:    banner_profile_file: "{{ (banner_owner_home_cmd.stdout | trim) ~ '/' ~ restart_banner_profile_filename }}"    banner_status_file: "{{ (banner_owner_home_cmd.stdout | trim) ~ '/' ~ restart_banner_status_filename }}"- name: Ensure .profile prints banner when status file exists  blockinfile:    path: "{{ banner_profile_file }}"    create: true    marker: "# {mark} {{ restart_banner_block_id }}"    block: |      if [ -f "$HOME/{{ restart_banner_status_filename }}" ]; then        echo "############################################################"        cat "$HOME/{{ restart_banner_status_filename }}"        echo "############################################################"      fi  become: true  become_user: "{{ banner_owner }}"- name: Write banner status file (one write per profile batch)  copy:    dest: "{{ banner_status_file }}"    mode: "0644"    content: "{{ banner_summary }}\n"  become: true  become_user: "{{ banner_owner }}"- name: Track owners touched for cleanup  set_fact:    owners_touched: "{{ owners_touched | union([banner_owner]) }}"
+roles/websphere_jvm_restart/tasks/banner_cleanup.yml
+---- name: Cleanup banner artifacts for all touched owners  loop: "{{ owners_touched | default([]) }}"  loop_control:    loop_var: banner_owner  block:    - name: Determine banner_owner home directory      shell: "getent passwd {{ banner_owner }} | cut -d: -f6 || echo /home/{{ banner_owner }}"      register: banner_owner_home_cmd      changed_when: false      failed_when: false    - name: Remove status file      file:        path: "{{ (banner_owner_home_cmd.stdout | trim) ~ '/' ~ restart_banner_status_filename }}"        state: absent      become: true      become_user: "{{ banner_owner }}"    - name: Remove managed .profile banner block      blockinfile:        path: "{{ (banner_owner_home_cmd.stdout | trim) ~ '/' ~ restart_banner_profile_filename }}"        marker: "# {mark} {{ restart_banner_block_id }}"        state: absent      become: true      become_user: "{{ banner_owner }}"
+
+Aggregation + notify (unchanged, but still correct)
+roles/websphere_jvm_restart/tasks/aggregate_and_notify.yml
+---- name: Load payload to get ritm_number  set_fact:    ws_payload: "{{ vars[role_payload_var_name] | default({}) }}"- name: Extract ritm_number  set_fact:    ritm_number: >-      {{        ws_payload.get('ritm_number')        or ws_payload.get('RITM number')        or ws_payload.get('ritmNumber')      }}- name: Find role dynamic groups  set_fact:    role_dyn_groups: >-      {{        (groups.keys() | list)        | select('match', '^' ~ (role_group_prefix | regex_escape) ~ '_')        | list      }}- name: Collect results from all hosts in role groups  set_fact:    all_jvm_results: "{{ (all_jvm_results | default([])) + (hostvars[target_host].jvm_results | default([])) }}"  loop: "{{ role_dyn_groups | map('extract', groups) | list | flatten }}"  loop_control:    loop_var: target_host    label: "{{ target_host }}"- name: Build failed_hosts list  set_fact:    failed_hosts: >-      {{        (all_jvm_results | default([])          | selectattr('status','equalto','failed')          | map(attribute='env_host_profile_jvm')          | list)      }}- name: Compute summary  set_fact:    overall_status: "{{ 'failed' if (failed_hosts | length > 0) else 'success' }}"    total_count: "{{ all_jvm_results | default([]) | length }}"    success_count: "{{ (all_jvm_results | default([]) | selectattr('status','equalto','success') | list | length) }}"    fail_count: "{{ failed_hosts | length }}"- name: Build ServiceNow body  set_fact:    snow_body_info:      status: "{{ overall_status }}"      ritm_number: "{{ ritm_number }}"      failed_hosts: "{{ failed_hosts }}"      message: >-        JVM restart summary for RITM {{ ritm_number }}.        Total: {{ total_count }}, Success: {{ success_count }}, Failed: {{ fail_count }}.- name: Send ServiceNow update  include_tasks: snow_update.yml
+roles/websphere_jvm_restart/tasks/snow_update.yml
+---- name: Validate ServiceNow endpoint settings  assert:    that:      - snow_instance_url | length > 0      - snow_update_path | length > 0    fail_msg: "snow_instance_url and snow_update_path must be set."- name: Build headers  set_fact:    snow_headers: >-      {{        {          'Accept': 'application/json',          'Content-Type': 'application/json'        }        | combine(            (snow_bearer_token | length > 0)            | ternary({'Authorization': 'Bearer ' ~ snow_bearer_token}, {})          )      }}- name: POST update to ServiceNow  uri:    url: "{{ snow_instance_url }}{{ snow_update_path }}"    method: POST    headers: "{{ snow_headers }}"    body_format: json    body: "{{ snow_body_info }}"    validate_certs: "{{ snow_validate_certs }}"    force_basic_auth: "{{ (snow_user | length > 0) and (snow_password | length > 0) }}"    user: "{{ snow_user | default(omit) }}"    password: "{{ snow_password | default(omit) }}"    status_code: [200, 201, 202, 204]  no_log: true
+
+4) What exactly made it faster (and why)
+A) serverStatus.sh -all reduced drastically
+Old: per JVM you might do pre + post → 2 * num_jvms calls
+New: per profile you do pre once + post once → 2 * num_profiles calls
+If you have 1 profile with 10 JVMs, you cut from 20 calls → 2 calls.
+B) Install root check only once per host
+Old: if PID missing, you might stat 4 roots per JVM.
+New: you stat once, cache cached_install_root, reuse it for all JVMs.
+C) Banner writes reduced
+Old: per JVM banner updates
+New: banner is set once per profile batch (and only for the owner used). Cleanup once at host end.
+D) Still safe stop/restart
+You still get:
+
+
+stop async
+
+
+PID disappearance polling
+
+
+kill -9 if needed
+
+
+verify PID gone before starting
+
+
+
+5) Example showing env behavior with this optimized flow
+Payload:
+jvm_restart:  ritm_number: RITM9999  envs:    dev:      hosts:        devapp1:          AppSrv01: [server1, server2]    prod:      hosts:        prodapp1:          AppSrvP01: [server1]
+Build inventory creates groups:
+
+
+wsjvm_restart_targets_dev: devapp1
+
+
+wsjvm_restart_targets_prod: prodapp1
+
+
+Execute play (hosts: all) runs only on:
+
+
+devapp1 (in dev group)
+
+
+prodapp1 (in prod group)
+
+
+And each host processes:
+
+
+profile batches (serverStatus per profile once pre/post)
+
+
+
+If you want the failed_hosts format to be exactly ["host:profile:jvm"] (without env), I can switch aggregation to use host_profile_jvm (one-line change), but since you now use envs, keeping env in the string is usually better for review.
