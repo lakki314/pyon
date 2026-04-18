@@ -1,0 +1,102 @@
+Below is a ready-to-use JSON payload you can pass to curl to launch an AWX/Ansible Controller Job Template (or Workflow Template) for your JVM restart automation.
+
+I’m assuming:
+
+Your playbook expects the payload variable name jvm_restart
+And the structure is env → hosts → profiles → jvms.
+1) JSON payload (extra_vars) for the Job Template launch
+Example (DEV + PROD in same request)
+{
+  "extra_vars": {
+    "jvm_restart": {
+      "ritm_number": "RITM1234",
+      "envs": {
+        "dev": {
+          "hosts": {
+            "test1": {
+              "AppSrv01": ["server1", "server2"]
+            },
+            "test2": {
+              "AppSrv02": ["server3", "server4"]
+            }
+          }
+        },
+        "prod": {
+          "hosts": {
+            "prodapp1": {
+              "AppSrvP01": ["server1"]
+            }
+          }
+        }
+      }
+    }
+  }
+}
+2) curl for AWX/Controller Job Template launch
+Basic Auth
+curl -k -X POST \
+  -H "Content-Type: application/json" \
+  -u "awx_user:awx_password" \
+  "https://AWX_HOST/api/v2/job_templates/JOB_TEMPLATE_ID/launch/" \
+  -d '{
+    "extra_vars": {
+      "jvm_restart": {
+        "ritm_number": "RITM1234",
+        "envs": {
+          "dev": {
+            "hosts": {
+              "test1": { "AppSrv01": ["server1", "server2"] },
+              "test2": { "AppSrv02": ["server3", "server4"] }
+            }
+          }
+        }
+      }
+    }
+  }'
+Bearer Token
+curl -k -X POST \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_TOKEN_HERE" \
+  "https://AWX_HOST/api/v2/job_templates/JOB_TEMPLATE_ID/launch/" \
+  -d '{
+    "extra_vars": {
+      "jvm_restart": {
+        "ritm_number": "RITM1234",
+        "envs": {
+          "dev": {
+            "hosts": {
+              "test1": { "AppSrv01": ["server1", "server2"] }
+            }
+          }
+        }
+      }
+    }
+  }'
+3) If you need to set inventory / limit / verbosity in the same launch
+
+(Some Controller setups allow these fields; if not, Controller will reject them.)
+
+{
+  "inventory": 12,
+  "limit": "test1,test2",
+  "verbosity": 2,
+  "extra_vars": {
+    "jvm_restart": {
+      "ritm_number": "RITM1234",
+      "envs": {
+        "dev": {
+          "hosts": {
+            "test1": { "AppSrv01": ["server1", "server2"] },
+            "test2": { "AppSrv02": ["server3"] }
+          }
+        }
+      }
+    }
+  }
+}
+Notes (so it works smoothly)
+Host keys like "test1" must match reachable inventory hostnames in Controller (or resolvable DNS).
+If your job template doesn’t allow inventory override or limit override, remove those fields.
+The payload should be passed exactly under "extra_vars": { "jvm_restart": ... }.
+
+If you tell me whether you’re launching a Job Template or Workflow Template, and what fields your template allows on launch (inventory/limit/credentials), I can tailor the exact curl body to match Controller validation rules.
