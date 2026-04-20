@@ -1,0 +1,252 @@
+Yes. Put the client certificate and key in the role’s files/ directory, and have the role build the full paths from role_path. The CyberArk Ansible module accepts client_cert and client_key as file paths, and CyberArk CCP supports client-certificate authentication for password retrieval.
+
+Role structure
+roles/
+└── cyberark_ccp_password/
+    ├── defaults/
+    │   └── main.yml
+    ├── files/
+    │   ├── client.crt
+    │   └── client.key
+    └── tasks/
+        └── main.yml
+defaults/main.yml
+---
+cyberark_ccp_url: ""
+cyberark_app_id: ""
+cyberark_safe: ""
+
+# One or many user variable names
+cyberark_user_var_name: ""
+cyberark_user_var_names: []
+
+# Cert and key are stored in role files/
+cyberark_client_cert_file: "client.crt"
+cyberark_client_key_file: "client.key"
+
+cyberark_validate_certs: true
+cyberark_connection_timeout: 30
+cyberark_query_format: "Exact"
+cyberark_fail_request_on_password_change: false
+cyberark_path: "/AIMWebService/api/Accounts"
+cyberark_reason: ""
+
+# Optional query parts
+cyberark_folder: ""
+cyberark_object: ""
+cyberark_address: ""
+cyberark_database: ""
+cyberark_policy_id: ""
+cyberark_query_extra: ""
+
+cyberark_delegate_to: "localhost"
+cyberark_no_log: true
+tasks/main.yml
+---
+- name: Normalize requested user variable names
+  ansible.builtin.set_fact:
+    __cyberark_user_vars: >-
+      {{
+        cyberark_user_var_names
+        if (cyberark_user_var_names | length > 0)
+        else (
+          [cyberark_user_var_name]
+          if (cyberark_user_var_name | length > 0)
+          else []
+        )
+      }}
+  no_log: "{{ cyberark_no_log }}"
+
+- name: Resolve cert and key paths from role files directory
+  ansible.builtin.set_fact:
+    __cyberark_client_cert_path: "{{ role_path }}/files/{{ cyberark_client_cert_file }}"
+    __cyberark_client_key_path: "{{ role_path }}/files/{{ cyberark_client_key_file }}"
+  no_log: "{{ cyberark_no_log }}"
+
+- name: Validate required CyberArk inputs
+  ansible.builtin.assert:
+    that:
+      - cyberark_ccp_url | length > 0
+      - cyberark_app_id | length > 0
+      - cyberark_safe | length > 0
+      - __cyberark_user_vars | length > 0
+    fail_msg: >-
+      Provide cyberark_ccp_url, cyberark_app_id, cyberark_safe, and either
+      cyberark_user_var_name or cyberark_user_var_names.
+  no_log: "{{ cyberark_no_log }}"
+
+- name: Validate each requested username variable exists
+  ansible.builtin.assert:
+    that:
+      - item in vars
+      - vars[item] | string | length > 0
+    fail_msg: "Username variable {{ item }} is not defined or is empty."
+  loop: "{{ __cyberark_user_vars }}"
+  loop_control:
+    label: "{{ item }}"
+  no_log: "{{ cyberark_no_log }}"
+
+- name: Validate client cert and key files exist in role files directory
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ __cyberark_client_cert_path }}"
+    - "{{ __cyberark_client_key_path }}"
+  register: __cyberark_cert_files
+  delegate_to: "{{ cyberark_delegate_to }}"
+  no_log: "{{ cyberark_no_log }}"
+
+- name: Assert client cert and key files are present
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.isreg
+    fail_msg: "Missing required file: {{ item.stat.path | default('unknown path') }}"
+  loop: "{{ __cyberark_cert_files.results }}"
+  loop_control:
+    label: "{{ item.stat.path | default('unknown path') }}"
+  no_log: "{{ cyberark_no_log }}"
+
+- name: Build lookup targets
+  ansible.builtin.set_fact:
+    __cyberark_targets: >-
+      {{
+        (__cyberark_targets | default([])) + [
+          {
+            'user_var_name': item,
+            'username_value': (vars[item] | string),
+            'password_var_name':
+              (
+                (item | regex_replace('_user$', '_password'))
+                if (item is match('.*_user$'))
+                else (item ~ '_password')
+              )
+          }
+        ]
+      }}
+  loop: "{{ __cyberark_user_vars }}"
+  loop_control:
+    label: "{{ item }}"
+  no_log: "{{ cyberark_no_log }}"
+
+- name: Retrieve passwords from CyberArk CCP using cert-based auth
+  cyberark.pas.cyberark_credential:
+    api_base_url: "{{ cyberark_ccp_url }}"
+    app_id: "{{ cyberark_app_id }}"
+    client_cert: "{{ __cyberark_client_cert_path }}"
+    client_key: "{{ __cyberark_client_key_path }}"
+    validate_certs: "{{ cyberark_validate_certs }}"
+    connection_timeout: "{{ cyberark_connection_timeout }}"
+    fail_request_on_password_change: "{{ cyberark_fail_request_on_password_change }}"
+    path: "{{ cyberark_path }}"
+    query_format: "{{ cyberark_query_format }}"
+    reason: "{{ cyberark_reason if cyberark_reason | length > 0 else omit }}"
+    query: >-
+      {{
+        'Safe=' ~ cyberark_safe ~
+        ';UserName=' ~ item.username_value ~
+        (';Folder=' ~ cyberark_folder if cyberark_folder | length > 0 else '') ~
+        (';Object=' ~ cyberark_object if cyberark_object | length > 0 else '') ~
+        (';Address=' ~ cyberark_address if cyberark_address | length > 0 else '') ~
+        (';Database=' ~ cyberark_database if cyberark_database | length > 0 else '') ~
+        (';PolicyID=' ~ cyberark_policy_id if cyberark_policy_id | length > 0 else '') ~
+        (';' ~ cyberark_query_extra if cyberark_query_extra | length > 0 else '')
+      }}
+  register: __cyberark_fetch
+  loop: "{{ __cyberark_targets }}"
+  loop_control:
+    label: "{{ item.user_var_name }}"
+  delegate_to: "{{ cyberark_delegate_to }}"
+  no_log: "{{ cyberark_no_log }}"
+
+- name: Publish individual *_password facts
+  ansible.builtin.set_fact:
+    "{{ item.item.password_var_name }}": "{{ item.result.Content | default(item.Content) }}"
+  loop: "{{ __cyberark_fetch.results }}"
+  loop_control:
+    label: "{{ item.item.password_var_name }}"
+  no_log: "{{ cyberark_no_log }}"
+
+- name: Publish combined password map
+  ansible.builtin.set_fact:
+    cyberark_password_map: >-
+      {{
+        (cyberark_password_map | default({})) |
+        combine({
+          item.item.password_var_name:
+            (item.result.Content | default(item.Content))
+        })
+      }}
+  loop: "{{ __cyberark_fetch.results }}"
+  loop_control:
+    label: "{{ item.item.password_var_name }}"
+  no_log: "{{ cyberark_no_log }}"
+Single user example
+---
+- name: Retrieve WAS password
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    was_user: wasadmin
+
+  tasks:
+    - name: Import CyberArk role
+      ansible.builtin.import_role:
+        name: cyberark_ccp_password
+      vars:
+        cyberark_ccp_url: "https://ccp.company.com"
+        cyberark_app_id: "AnsibleCertAuthApp"
+        cyberark_safe: "MiddlewareSafe"
+        cyberark_user_var_name: "was_user"
+
+    - name: Example use
+      ansible.builtin.debug:
+        var: was_password
+      no_log: true
+
+This creates:
+
+was_password: <retrieved password>
+Multiple user example
+---
+- name: Retrieve multiple passwords
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    was_user: wasadmin
+    db_user: dbadmin
+    mq_user: mqadmin
+
+  tasks:
+    - name: Import CyberArk role
+      ansible.builtin.import_role:
+        name: cyberark_ccp_password
+      vars:
+        cyberark_ccp_url: "https://ccp.company.com"
+        cyberark_app_id: "AnsibleCertAuthApp"
+        cyberark_safe: "MiddlewareSafe"
+        cyberark_user_var_names:
+          - was_user
+          - db_user
+          - mq_user
+
+    - name: Example use
+      ansible.builtin.debug:
+        msg:
+          - "was_password exists"
+          - "db_password exists"
+          - "mq_password exists"
+      no_log: true
+
+This creates:
+
+was_password: <retrieved password>
+db_password: <retrieved password>
+mq_password: <retrieved password>
+Notes
+
+The role uses the same client certificate and key from roles/cyberark_ccp_password/files/ for all lookups in that role invocation. The CyberArk module expects path-based client_cert and client_key, and the password returned by CCP is exposed in Content.
+
+If you want, I can next convert this to an AWX workflow-friendly role that also publishes the generated *_password facts through set_stats for downstream job templates.
