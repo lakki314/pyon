@@ -249,4 +249,4 @@ Notes
 
 The role uses the same client certificate and key from roles/cyberark_ccp_password/files/ for all lookups in that role invocation. The CyberArk module expects path-based client_cert and client_key, and the password returned by CCP is exposed in Content.
 
-If you want, I can next convert this to an AWX workflow-friendly role that also publishes the generated *_password facts through set_stats for downstream job templates.
+If you want, I can next convert this to an AWX workflow-friendly role that also publishes the generated *_password facts through set_stats for downstream job templates.wd
