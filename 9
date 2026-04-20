@@ -1,1072 +1,252 @@
-Below is the full updated router playbook + full websphere_jvm_restart role with ALL the latest changes integrated:
+Yes. Put the client certificate and key in the role’s files/ directory, and have the role build the full paths from role_path. The CyberArk Ansible module accepts client_cert and client_key as file paths, and CyberArk CCP supports client-certificate authentication for password retrieval.
 
-✅ ps vs cache rule (running → ps, not running → cached install root/owner)
-✅ debug (wsjvm_debug: true)
-✅ profile-batched serverStatus.sh -all (pre once + post once per profile)
-✅ cached install root/owner populated only when needed
-✅ nodeagent/dmgr special stop/start scripts
-✅ nodeagent/dmgr special PID lookup:
-
-ps -ef | grep dmgr | grep <profile_name>
-ps -ef | grep nodeagent | grep <profile_name>
-
-✅ nodeagent/dmgr: owner comes from ps if running, but profile_bin comes from cache (reliable)
-✅ app servers: owner/path from ps last-4-words when running
-
-1) File structure
-playbooks/
-  auto_router.yml
-
+Role structure
 roles/
-  websphere_jvm_restart/
-    defaults/
-      main.yml
-    tasks/
-      build_inventory.yml
-      build_one_env.yml
-      build_one_host.yml
-      append_profile_jvms.yml
-
-      execute_on_host.yml
-      restart_profile.yml
-      restart_started_jvm.yml
-      banner_set_host.yml
-      banner_cleanup.yml
-
-      aggregate_and_notify.yml
-      snow_update.yml
-2) Router Playbook (FULL)
-playbooks/auto_router.yml
+└── cyberark_ccp_password/
+    ├── defaults/
+    │   └── main.yml
+    ├── files/
+    │   ├── client.crt
+    │   └── client.key
+    └── tasks/
+        └── main.yml
+defaults/main.yml
 ---
-- name: Detect payload and build inventory for selected automation
+cyberark_ccp_url: ""
+cyberark_app_id: ""
+cyberark_safe: ""
+
+# One or many user variable names
+cyberark_user_var_name: ""
+cyberark_user_var_names: []
+
+# Cert and key are stored in role files/
+cyberark_client_cert_file: "client.crt"
+cyberark_client_key_file: "client.key"
+
+cyberark_validate_certs: true
+cyberark_connection_timeout: 30
+cyberark_query_format: "Exact"
+cyberark_fail_request_on_password_change: false
+cyberark_path: "/AIMWebService/api/Accounts"
+cyberark_reason: ""
+
+# Optional query parts
+cyberark_folder: ""
+cyberark_object: ""
+cyberark_address: ""
+cyberark_database: ""
+cyberark_policy_id: ""
+cyberark_query_extra: ""
+
+cyberark_delegate_to: "localhost"
+cyberark_no_log: true
+tasks/main.yml
+---
+- name: Normalize requested user variable names
+  ansible.builtin.set_fact:
+    __cyberark_user_vars: >-
+      {{
+        cyberark_user_var_names
+        if (cyberark_user_var_names | length > 0)
+        else (
+          [cyberark_user_var_name]
+          if (cyberark_user_var_name | length > 0)
+          else []
+        )
+      }}
+  no_log: "{{ cyberark_no_log }}"
+
+- name: Resolve cert and key paths from role files directory
+  ansible.builtin.set_fact:
+    __cyberark_client_cert_path: "{{ role_path }}/files/{{ cyberark_client_cert_file }}"
+    __cyberark_client_key_path: "{{ role_path }}/files/{{ cyberark_client_key_file }}"
+  no_log: "{{ cyberark_no_log }}"
+
+- name: Validate required CyberArk inputs
+  ansible.builtin.assert:
+    that:
+      - cyberark_ccp_url | length > 0
+      - cyberark_app_id | length > 0
+      - cyberark_safe | length > 0
+      - __cyberark_user_vars | length > 0
+    fail_msg: >-
+      Provide cyberark_ccp_url, cyberark_app_id, cyberark_safe, and either
+      cyberark_user_var_name or cyberark_user_var_names.
+  no_log: "{{ cyberark_no_log }}"
+
+- name: Validate each requested username variable exists
+  ansible.builtin.assert:
+    that:
+      - item in vars
+      - vars[item] | string | length > 0
+    fail_msg: "Username variable {{ item }} is not defined or is empty."
+  loop: "{{ __cyberark_user_vars }}"
+  loop_control:
+    label: "{{ item }}"
+  no_log: "{{ cyberark_no_log }}"
+
+- name: Validate client cert and key files exist in role files directory
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ __cyberark_client_cert_path }}"
+    - "{{ __cyberark_client_key_path }}"
+  register: __cyberark_cert_files
+  delegate_to: "{{ cyberark_delegate_to }}"
+  no_log: "{{ cyberark_no_log }}"
+
+- name: Assert client cert and key files are present
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.isreg
+    fail_msg: "Missing required file: {{ item.stat.path | default('unknown path') }}"
+  loop: "{{ __cyberark_cert_files.results }}"
+  loop_control:
+    label: "{{ item.stat.path | default('unknown path') }}"
+  no_log: "{{ cyberark_no_log }}"
+
+- name: Build lookup targets
+  ansible.builtin.set_fact:
+    __cyberark_targets: >-
+      {{
+        (__cyberark_targets | default([])) + [
+          {
+            'user_var_name': item,
+            'username_value': (vars[item] | string),
+            'password_var_name':
+              (
+                (item | regex_replace('_user$', '_password'))
+                if (item is match('.*_user$'))
+                else (item ~ '_password')
+              )
+          }
+        ]
+      }}
+  loop: "{{ __cyberark_user_vars }}"
+  loop_control:
+    label: "{{ item }}"
+  no_log: "{{ cyberark_no_log }}"
+
+- name: Retrieve passwords from CyberArk CCP using cert-based auth
+  cyberark.pas.cyberark_credential:
+    api_base_url: "{{ cyberark_ccp_url }}"
+    app_id: "{{ cyberark_app_id }}"
+    client_cert: "{{ __cyberark_client_cert_path }}"
+    client_key: "{{ __cyberark_client_key_path }}"
+    validate_certs: "{{ cyberark_validate_certs }}"
+    connection_timeout: "{{ cyberark_connection_timeout }}"
+    fail_request_on_password_change: "{{ cyberark_fail_request_on_password_change }}"
+    path: "{{ cyberark_path }}"
+    query_format: "{{ cyberark_query_format }}"
+    reason: "{{ cyberark_reason if cyberark_reason | length > 0 else omit }}"
+    query: >-
+      {{
+        'Safe=' ~ cyberark_safe ~
+        ';UserName=' ~ item.username_value ~
+        (';Folder=' ~ cyberark_folder if cyberark_folder | length > 0 else '') ~
+        (';Object=' ~ cyberark_object if cyberark_object | length > 0 else '') ~
+        (';Address=' ~ cyberark_address if cyberark_address | length > 0 else '') ~
+        (';Database=' ~ cyberark_database if cyberark_database | length > 0 else '') ~
+        (';PolicyID=' ~ cyberark_policy_id if cyberark_policy_id | length > 0 else '') ~
+        (';' ~ cyberark_query_extra if cyberark_query_extra | length > 0 else '')
+      }}
+  register: __cyberark_fetch
+  loop: "{{ __cyberark_targets }}"
+  loop_control:
+    label: "{{ item.user_var_name }}"
+  delegate_to: "{{ cyberark_delegate_to }}"
+  no_log: "{{ cyberark_no_log }}"
+
+- name: Publish individual *_password facts
+  ansible.builtin.set_fact:
+    "{{ item.item.password_var_name }}": "{{ item.result.Content | default(item.Content) }}"
+  loop: "{{ __cyberark_fetch.results }}"
+  loop_control:
+    label: "{{ item.item.password_var_name }}"
+  no_log: "{{ cyberark_no_log }}"
+
+- name: Publish combined password map
+  ansible.builtin.set_fact:
+    cyberark_password_map: >-
+      {{
+        (cyberark_password_map | default({})) |
+        combine({
+          item.item.password_var_name:
+            (item.result.Content | default(item.Content))
+        })
+      }}
+  loop: "{{ __cyberark_fetch.results }}"
+  loop_control:
+    label: "{{ item.item.password_var_name }}"
+  no_log: "{{ cyberark_no_log }}"
+Single user example
+---
+- name: Retrieve WAS password
   hosts: localhost
   gather_facts: false
 
   vars:
-    wsjvm_debug: false  # set true at launch for debug
-
-    role_registry:
-      - payload_var: "jvm_restart"
-        role_name: "websphere_jvm_restart"
-        group_prefix: "wsjvm_restart_targets"
-
-      # ---- FUTURE EXAMPLE (commented) ----
-      # - payload_var: "ihs_restart"
-      #   role_name: "ihs_restart_role"
-      #   group_prefix: "ihs_restart_targets"
+    was_user: wasadmin
 
   tasks:
-    - name: Find which payloads are defined at launch
-      set_fact:
-        matched_specs: >-
-          {{
-            role_registry
-            | selectattr('payload_var', 'in', vars.keys() | list)
-            | list
-          }}
-
-    - name: Validate exactly one supported payload is provided
-      assert:
-        that:
-          - matched_specs | length == 1
-        fail_msg: >-
-          Expected exactly ONE supported payload at launch.
-          Supported: {{ role_registry | map(attribute='payload_var') | list }}
-          Received: {{
-            (role_registry | map(attribute='payload_var') | list)
-            | select('in', vars.keys() | list)
-            | list
-          }}
-
-    - name: Select role spec
-      set_fact:
-        selected_payload_var_name: "{{ matched_specs[0].payload_var }}"
-        selected_role_name: "{{ matched_specs[0].role_name }}"
-        selected_group_prefix: "{{ matched_specs[0].group_prefix }}"
-        wsjvm_debug_selected: "{{ wsjvm_debug | bool }}"
-
-    - name: Build dynamic inventory for selected role
-      include_role:
-        name: "{{ selected_role_name }}"
-        tasks_from: build_inventory.yml
+    - name: Import CyberArk role
+      ansible.builtin.import_role:
+        name: cyberark_ccp_password
       vars:
-        role_payload_var_name: "{{ selected_payload_var_name }}"
-        role_group_prefix: "{{ selected_group_prefix }}"
-        wsjvm_debug: "{{ wsjvm_debug_selected }}"
+        cyberark_ccp_url: "https://ccp.company.com"
+        cyberark_app_id: "AnsibleCertAuthApp"
+        cyberark_safe: "MiddlewareSafe"
+        cyberark_user_var_name: "was_user"
 
-    # Debug created hosts/vars
-    - name: Debug - show dynamic groups created
-      when: wsjvm_debug_selected
-      debug:
-        msg:
-          group_prefix: "{{ selected_group_prefix }}"
-          dynamic_groups: >-
-            {{
-              (groups.keys() | list)
-              | select('match', '^' ~ (selected_group_prefix | regex_escape) ~ '_')
-              | list
-            }}
+    - name: Example use
+      ansible.builtin.debug:
+        var: was_password
+      no_log: true
 
-    - name: Debug - show hosts per dynamic group
-      when: wsjvm_debug_selected
-      debug:
-        msg:
-          group: "{{ dyn_group }}"
-          hosts: "{{ groups[dyn_group] | default([]) }}"
-      loop: >-
-        {{
-          (groups.keys() | list)
-          | select('match', '^' ~ (selected_group_prefix | regex_escape) ~ '_')
-          | list
-        }}
-      loop_control:
-        loop_var: dyn_group
+This creates:
 
-    - name: Debug - show vars for each created host
-      when: wsjvm_debug_selected
-      debug:
-        msg:
-          host: "{{ dyn_host }}"
-          env_name: "{{ hostvars[dyn_host].env_name | default('') }}"
-          ritm_number: "{{ hostvars[dyn_host].ritm_number | default('') }}"
-          restart_requests_count: "{{ (hostvars[dyn_host].restart_requests | default([])) | length }}"
-          restart_requests: "{{ hostvars[dyn_host].restart_requests | default([]) }}"
-      loop: >-
-        {{
-          (groups.keys() | list)
-          | select('match', '^' ~ (selected_group_prefix | regex_escape) ~ '_')
-          | map('extract', groups)
-          | list
-          | flatten
-          | unique
-        }}
-      loop_control:
-        loop_var: dyn_host
-
-- name: Execute selected role on dynamic hosts (parallel per host)
-  hosts: all
-  gather_facts: false
-  strategy: free
-
-  vars:
-    selected_role_name: "{{ hostvars['localhost'].selected_role_name }}"
-    selected_payload_var_name: "{{ hostvars['localhost'].selected_payload_var_name }}"
-    selected_group_prefix: "{{ hostvars['localhost'].selected_group_prefix }}"
-    wsjvm_debug_selected: "{{ hostvars['localhost'].wsjvm_debug_selected | default(false) }}"
-
-  tasks:
-    - name: Execute selected role on hosts that belong to its groups
-      include_role:
-        name: "{{ selected_role_name }}"
-        tasks_from: execute_on_host.yml
-      vars:
-        role_payload_var_name: "{{ selected_payload_var_name }}"
-        role_group_prefix: "{{ selected_group_prefix }}"
-        wsjvm_debug: "{{ wsjvm_debug_selected }}"
-      when: >
-        (group_names | select('match', '^' ~ (selected_group_prefix | regex_escape) ~ '_') | list | length) > 0
-
-- name: Aggregate results and notify ServiceNow (selected role only)
+was_password: <retrieved password>
+Multiple user example
+---
+- name: Retrieve multiple passwords
   hosts: localhost
   gather_facts: false
 
   vars:
-    selected_role_name: "{{ hostvars['localhost'].selected_role_name }}"
-    selected_payload_var_name: "{{ hostvars['localhost'].selected_payload_var_name }}"
-    selected_group_prefix: "{{ hostvars['localhost'].selected_group_prefix }}"
-    wsjvm_debug_selected: "{{ hostvars['localhost'].wsjvm_debug_selected | default(false) }}"
+    was_user: wasadmin
+    db_user: dbadmin
+    mq_user: mqadmin
 
   tasks:
-    - name: Aggregate and notify for selected role
-      include_role:
-        name: "{{ selected_role_name }}"
-        tasks_from: aggregate_and_notify.yml
+    - name: Import CyberArk role
+      ansible.builtin.import_role:
+        name: cyberark_ccp_password
       vars:
-        role_payload_var_name: "{{ selected_payload_var_name }}"
-        role_group_prefix: "{{ selected_group_prefix }}"
-        wsjvm_debug: "{{ wsjvm_debug_selected }}"
-3) Role: websphere_jvm_restart (FULL)
-3.1 Defaults
-roles/websphere_jvm_restart/defaults/main.yml
----
-role_payload_var_name: "jvm_restart"
-role_group_prefix: "wsjvm_restart_targets"
-wsjvm_debug: false
-
-restart_wait_retries: 30
-restart_wait_delay: 10
-
-stop_timeout_seconds: 600
-stop_check_delay: 15
-
-was_install_roots:
-  - "/opt/wps8/websphere/AppServer/85/"
-  - "/opt/websphere/85/commonprofile/AppServer"
-  - "/opt/websphere/90/commonprofile/AppServer"
-  - "/opt/websphere/85/AppServer/"
-
-restart_banner_enabled: true
-restart_banner_status_filename: ".was_jvm_restart_status"
-restart_banner_profile_filename: ".profile"
-restart_banner_block_id: "ANSIBLE MANAGED - WAS JVM RESTART BANNER"
-
-snow_instance_url: ""
-snow_update_path: ""
-snow_validate_certs: true
-snow_user: ""
-snow_password: ""
-snow_bearer_token: ""
-3.2 Build inventory tasks
-roles/websphere_jvm_restart/tasks/build_inventory.yml
----
-- name: Load payload
-  set_fact:
-    ws_payload: "{{ vars[role_payload_var_name] | default({}) }}"
-
-- name: Validate payload exists
-  assert:
-    that:
-      - ws_payload is mapping
-      - ws_payload | length > 0
-    fail_msg: "Payload var '{{ role_payload_var_name }}' is missing or empty."
-
-- name: Extract ritm_number
-  set_fact:
-    ritm_number: >-
-      {{
-        ws_payload.get('ritm_number')
-        or ws_payload.get('RITM number')
-        or ws_payload.get('ritmNumber')
-      }}
-
-- name: Validate ritm_number
-  assert:
-    that:
-      - ritm_number is defined
-      - ritm_number | length > 0
-    fail_msg: "ritm_number is missing in '{{ role_payload_var_name }}'."
-
-- name: Extract envs map
-  set_fact:
-    envs_map: "{{ ws_payload.get('envs', {}) }}"
-
-- name: Validate envs map
-  assert:
-    that:
-      - envs_map is mapping
-      - envs_map | length > 0
-    fail_msg: "payload.envs is missing/empty in '{{ role_payload_var_name }}'."
-
-- name: Convert envs map to list
-  set_fact:
-    env_specs: "{{ envs_map | dict2items }}"
-
-- name: Build dynamic inventory per env
-  include_tasks: build_one_env.yml
-  loop: "{{ env_specs }}"
-  loop_control:
-    loop_var: env_spec
-    label: "{{ env_spec.key }}"
-roles/websphere_jvm_restart/tasks/build_one_env.yml
----
-- name: Set env context
-  set_fact:
-    env_name: "{{ env_spec.key }}"
-    env_hosts_map: "{{ env_spec.value.get('hosts', {}) }}"
-
-- name: Validate env hosts
-  assert:
-    that:
-      - env_hosts_map is mapping
-      - env_hosts_map | length > 0
-    fail_msg: "No hosts under env {{ env_name }}."
-
-- name: Convert host map to list
-  set_fact:
-    host_specs: "{{ env_hosts_map | dict2items }}"
-
-- name: Build inventory entries per host
-  include_tasks: build_one_host.yml
-  loop: "{{ host_specs }}"
-  loop_control:
-    loop_var: host_spec
-    label: "{{ env_name }} -> {{ host_spec.key }}"
-roles/websphere_jvm_restart/tasks/build_one_host.yml
----
-- name: Initialize restart_requests
-  set_fact:
-    restart_requests: []
-
-- name: Convert profiles map to list
-  set_fact:
-    profile_specs: "{{ host_spec.value | dict2items }}"
-
-- name: Append profile/jvm pairs
-  include_tasks: append_profile_jvms.yml
-  loop: "{{ profile_specs }}"
-  loop_control:
-    loop_var: profile_spec
-    label: "{{ env_name }} -> {{ host_spec.key }} -> {{ profile_spec.key }}"
-
-- name: Add host to dynamic group
-  add_host:
-    name: "{{ host_spec.key }}"
-    groups: "{{ role_group_prefix }}_{{ env_name }}"
-    ritm_number: "{{ ritm_number }}"
-    env_name: "{{ env_name }}"
-    restart_requests: "{{ restart_requests }}"
-roles/websphere_jvm_restart/tasks/append_profile_jvms.yml
----
-- name: Append JVMs for this profile
-  set_fact:
-    restart_requests: "{{ restart_requests + [ {'profile_name': profile_spec.key, 'jvm_name': jvm_name_entry} ] }}"
-  loop: "{{ profile_spec.value | default([]) }}"
-  loop_control:
-    loop_var: jvm_name_entry
-    label: "{{ profile_spec.key }} -> {{ jvm_name_entry }}"
-3.3 Execute on host (profile-batched, lazy cache)
-roles/websphere_jvm_restart/tasks/execute_on_host.yml
----
-- name: Initialize per-host tracking
-  set_fact:
-    jvm_results: "{{ jvm_results | default([]) }}"
-    owners_touched: "{{ owners_touched | default([]) }}"
-    cached_install_root: "{{ cached_install_root | default('') }}"
-    cached_install_owner: "{{ cached_install_owner | default('') }}"
-
-- name: Debug - host received vars
-  when: wsjvm_debug | bool
-  debug:
-    msg:
-      host: "{{ inventory_hostname }}"
-      env_name: "{{ env_name | default('') }}"
-      ritm_number: "{{ ritm_number | default('') }}"
-      restart_requests_count: "{{ (restart_requests | default([])) | length }}"
-
-- name: Validate restart_requests exist
-  assert:
-    that:
-      - restart_requests is defined
-      - restart_requests is sequence
-      - restart_requests | length > 0
-    fail_msg: "No restart_requests on {{ inventory_hostname }}."
-
-- name: Initialize profile_map
-  set_fact:
-    profile_map: {}
-
-- name: Build profile_map {profile_name: [jvm1,jvm2,...]}
-  set_fact:
-    profile_map: "{{ profile_map | combine({ req_profile: (profile_map.get(req_profile, []) + [req_jvm]) }) }}"
-  vars:
-    req_profile: "{{ req_entry.profile_name }}"
-    req_jvm: "{{ req_entry.jvm_name }}"
-  loop: "{{ restart_requests }}"
-  loop_control:
-    loop_var: req_entry
-    label: "{{ req_entry.profile_name }} -> {{ req_entry.jvm_name }}"
-
-- name: Convert profile_map to list
-  set_fact:
-    profile_specs: "{{ profile_map | dict2items }}"
-
-- name: Process each profile (serverStatus once pre and once post)
-  block:
-    - name: Restart JVMs for one profile
-      include_tasks: restart_profile.yml
-      loop: "{{ profile_specs }}"
-      loop_control:
-        loop_var: profile_spec
-        label: "{{ env_name | default('na') }}:{{ inventory_hostname }} -> {{ profile_spec.key }}"
-  always:
-    - name: Cleanup banners (always)
-      include_tasks: banner_cleanup.yml
-      when: restart_banner_enabled | bool
-3.4 Restart profile (dmgr/nodeagent aware PS discovery + cache path)
-roles/websphere_jvm_restart/tasks/restart_profile.yml
----
-- name: Set profile vars for this batch
-  set_fact:
-    profile_name: "{{ profile_spec.key }}"
-    profile_jvms: "{{ profile_spec.value | default([]) }}"
-
-- name: Validate JVM list for profile
-  assert:
-    that:
-      - profile_jvms is sequence
-      - profile_jvms | length > 0
-    fail_msg: "No JVMs for profile {{ profile_name }} on {{ inventory_hostname }}."
-
-# 1) PS discovery per JVM (dmgr/nodeagent special)
-- name: Try ps discovery for JVMs in this profile
-  shell: >-
-    {{
-      (discover_jvm == 'dmgr')
-      | ternary(
-          'ps -ef | grep dmgr | grep ' ~ (profile_name | quote) ~ ' | grep -v grep',
-          (discover_jvm == 'nodeagent')
-          | ternary(
-              'ps -ef | grep nodeagent | grep ' ~ (profile_name | quote) ~ ' | grep -v grep',
-              'ps -ef | grep java | grep ' ~ (discover_jvm | quote) ~ ' | grep -v grep'
-          )
-      )
-    }}
-  register: ps_discover_cmd
-  changed_when: false
-  failed_when: false
-  loop: "{{ profile_jvms }}"
-  loop_control:
-    loop_var: discover_jvm
-    label: "{{ profile_name }} -> ps check {{ discover_jvm }}"
-
-- name: Flatten discovery ps lines
-  set_fact:
-    ps_discover_lines: >-
-      {{
-        (ps_discover_cmd.results | default([]))
-        | map(attribute='stdout_lines')
-        | list
-        | flatten
-        | list
-      }}
-    ps_found: "{{ (ps_discover_lines | length) > 0 }}"
-
-# 2) If ps found, choose owner from ps. Path handling differs:
-# - app servers: try last-4-words rule
-# - dmgr/nodeagent: path from cache (stable), owner from ps
-- name: If ps found, derive owner and path
-  when: ps_found
-  block:
-    - set_fact:
-        ps_words: "{{ ps_discover_lines[0].split() }}"
-        jvm_owner: "{{ ps_words[0] }}"
-
-    - name: Determine if profile includes dmgr/nodeagent
-      set_fact:
-        has_special: "{{ (profile_jvms | intersect(['dmgr','nodeagent']) | length) > 0 }}"
-
-    - name: If special (dmgr/nodeagent), use cache for profile path
-      when: has_special
-      block:
-        - set_fact:
-            discovery_source: "ps(owner)+cache(path)"
-
-        - name: Populate cache only if empty
-          when: cached_install_root | length == 0
-          block:
-            - name: Check install roots
-              stat:
-                path: "{{ install_root }}"
-              loop: "{{ was_install_roots }}"
-              loop_control:
-                loop_var: install_root
-              register: install_root_stats
-
-            - name: Select first existing install root
-              set_fact:
-                cached_install_root: >-
-                  {{
-                    (install_root_stats.results
-                      | selectattr('stat.exists','equalto',true)
-                      | map(attribute='install_root')
-                      | list
-                      | first) | default('')
-                  }}
-
-            - name: Fail if no install root exists
-              assert:
-                that:
-                  - cached_install_root | length > 0
-                fail_msg: "No WebSphere install root found on {{ inventory_hostname }}."
-
-            - name: Determine cached owner
-              stat:
-                path: "{{ cached_install_root }}"
-              register: cached_root_stat
-
-            - set_fact:
-                cached_install_owner: "{{ cached_root_stat.stat.pw_name | default('') }}"
-            - when: cached_install_owner | length == 0
-              block:
-                - shell: "ls -ld {{ cached_install_root }} | awk '{print $3}'"
-                  register: cached_owner_cmd
-                  changed_when: false
-                - set_fact:
-                    cached_install_owner: "{{ cached_owner_cmd.stdout | trim }}"
-
-        - set_fact:
-            profile_dir: "{{ (cached_install_root | regex_replace('\\/$', '')) ~ '/profiles/' ~ profile_name }}"
-            profile_bin: "{{ (cached_install_root | regex_replace('\\/$', '')) ~ '/profiles/' ~ profile_name ~ '/bin' }}"
-            detected_cell_name: "unknown"
-
-        - name: Validate profile_dir exists
-          stat:
-            path: "{{ profile_dir }}"
-          register: profile_dir_stat
-        - assert:
-            that:
-              - profile_dir_stat.stat.exists
-            fail_msg: "Profile path not found: {{ profile_dir }}"
-
-    - name: If not special, derive profile path from ps last-4-words rule
-      when: not has_special
-      block:
-        - set_fact:
-            discovery_source: "ps(owner+path)"
-            detected_config_path: "{{ ps_words[-4] }}"
-            detected_cell_name: "{{ ps_words[-3] }}"
-            detected_profile_name: "{{ ps_words[-2] }}"
-
-        - name: Validate ps-derived profile matches
-          assert:
-            that:
-              - detected_profile_name == profile_name
-            fail_msg: "ps-derived profile {{ detected_profile_name }} != payload profile {{ profile_name }}"
-
-        - set_fact:
-            profile_dir: "{{ detected_config_path | regex_replace('\\/config$', '') }}"
-            profile_bin: "{{ (detected_config_path | regex_replace('\\/config$', '')) ~ '/bin' }}"
-
-# 3) If no ps found, use cache for owner+path
-- name: If no ps found, derive owner+path from cache
-  when: not ps_found
-  block:
-    - set_fact:
-        discovery_source: "cache(owner+path)"
-
-    - name: Populate cache only if empty
-      when: cached_install_root | length == 0
-      block:
-        - name: Debug - populating cache (JVMs down)
-          when: wsjvm_debug | bool
-          debug:
-            msg: "No JVM running for profile {{ profile_name }}. Populating install root cache on {{ inventory_hostname }}."
-
-        - name: Check install roots
-          stat:
-            path: "{{ install_root }}"
-          loop: "{{ was_install_roots }}"
-          loop_control:
-            loop_var: install_root
-          register: install_root_stats
-
-        - name: Select first existing install root
-          set_fact:
-            cached_install_root: >-
-              {{
-                (install_root_stats.results
-                  | selectattr('stat.exists','equalto',true)
-                  | map(attribute='install_root')
-                  | list
-                  | first) | default('')
-              }}
-
-        - name: Fail if no install root exists
-          assert:
-            that:
-              - cached_install_root | length > 0
-            fail_msg: "No WebSphere install root found on {{ inventory_hostname }}."
-
-        - name: Determine cached owner
-          stat:
-            path: "{{ cached_install_root }}"
-          register: cached_root_stat
-
-        - set_fact:
-            cached_install_owner: "{{ cached_root_stat.stat.pw_name | default('') }}"
-        - when: cached_install_owner | length == 0
-          block:
-            - shell: "ls -ld {{ cached_install_root }} | awk '{print $3}'"
-              register: cached_owner_cmd
-              changed_when: false
-            - set_fact:
-                cached_install_owner: "{{ cached_owner_cmd.stdout | trim }}"
-
-    - set_fact:
-        jvm_owner: "{{ cached_install_owner }}"
-        profile_dir: "{{ (cached_install_root | regex_replace('\\/$', '')) ~ '/profiles/' ~ profile_name }}"
-        profile_bin: "{{ (cached_install_root | regex_replace('\\/$', '')) ~ '/profiles/' ~ profile_name ~ '/bin' }}"
-        detected_cell_name: "unknown"
-
-    - name: Validate profile_dir exists
-      stat:
-        path: "{{ profile_dir }}"
-      register: profile_dir_stat
-    - assert:
-        that:
-          - profile_dir_stat.stat.exists
-        fail_msg: "Profile path not found: {{ profile_dir }}"
-
-- name: Debug - discovery outcome
-  when: wsjvm_debug | bool
-  debug:
-    msg:
-      host: "{{ inventory_hostname }}"
-      env: "{{ env_name | default('') }}"
-      profile: "{{ profile_name }}"
-      discovery_source: "{{ discovery_source }}"
-      jvm_owner: "{{ jvm_owner }}"
-      profile_bin: "{{ profile_bin }}"
-      cached_install_root: "{{ cached_install_root | default('') }}"
-      cached_install_owner: "{{ cached_install_owner | default('') }}"
-
-# Banner once per profile batch
-- name: Set host banner once for this owner
-  when: restart_banner_enabled | bool
-  include_tasks: banner_set_host.yml
-  vars:
-    banner_owner: "{{ jvm_owner }}"
-    banner_summary: >-
-      WebSphere JVM restart IN PROGRESS
-      RITM: {{ ritm_number }}
-      ENV: {{ env_name | default('na') }}
-      Host: {{ inventory_hostname }}
-      Profile: {{ profile_name }}
-      JVMs: {{ profile_jvms | join(', ') }}
-
-# serverStatus PRE once
-- name: Run serverStatus.sh -all (pre)
-  shell: "{{ profile_bin }}/serverStatus.sh -all"
-  register: server_status_pre
-  become: true
-  become_user: "{{ jvm_owner }}"
-  changed_when: false
-  failed_when: false
-
-- name: Classify JVMs from pre serverStatus
-  set_fact:
-    jvms_started_pre: []
-    jvms_stopped_pre: []
-
-- name: Classify each JVM
-  set_fact:
-    jvms_started_pre: "{{ jvms_started_pre + ([one_jvm] if started_hit else []) }}"
-    jvms_stopped_pre: "{{ jvms_stopped_pre + ([one_jvm] if stopped_hit else []) }}"
-  vars:
-    started_hit: "{{ (server_status_pre.stdout | default('') | regex_search('ADMU0508I: The Application Server \"' ~ (one_jvm | regex_escape) ~ '\" is STARTED')) is not none }}"
-    stopped_hit: "{{ (server_status_pre.stdout | default('') | regex_search('ADMU0509I: The Application Server \"' ~ (one_jvm | regex_escape) ~ '\" cannot be reached')) is not none }}"
-  loop: "{{ profile_jvms }}"
-  loop_control:
-    loop_var: one_jvm
-    label: "{{ profile_name }} -> classify {{ one_jvm }}"
-
-- name: Debug - pre classification
-  when: wsjvm_debug | bool
-  debug:
-    msg:
-      profile: "{{ profile_name }}"
-      started: "{{ jvms_started_pre }}"
-      stopped: "{{ jvms_stopped_pre }}"
-
-- name: Ensure all JVMs classified
-  assert:
-    that:
-      - (jvms_started_pre | length) + (jvms_stopped_pre | length) == (profile_jvms | length)
-    fail_msg: "Some JVMs were not found/classified in serverStatus output for profile {{ profile_name }}."
-
-# START stopped JVMs (special startNode/startManager)
-- name: Start STOPPED JVMs (dmgr/nodeagent special)
-  shell: >-
-    {{
-      (stopped_jvm == 'nodeagent')
-      | ternary(profile_bin ~ '/startNode.sh',
-        (stopped_jvm == 'dmgr')
-        | ternary(profile_bin ~ '/startManager.sh',
-          profile_bin ~ '/startServer.sh ' ~ stopped_jvm
-        )
-      )
-    }}
-  become: true
-  become_user: "{{ jvm_owner }}"
-  changed_when: true
-  loop: "{{ jvms_stopped_pre }}"
-  loop_control:
-    loop_var: stopped_jvm
-    label: "{{ profile_name }} -> start {{ stopped_jvm }}"
-
-# RESTART started JVMs safely (special stopNode/stopManager)
-- name: Restart STARTED JVMs safely
-  include_tasks: restart_started_jvm.yml
-  loop: "{{ jvms_started_pre }}"
-  loop_control:
-    loop_var: started_jvm
-    label: "{{ profile_name }} -> restart {{ started_jvm }}"
-  vars:
-    jvm_owner_for_restart: "{{ jvm_owner }}"
-    profile_bin_for_restart: "{{ profile_bin }}"
-    profile_name_for_restart: "{{ profile_name }}"
-
-# serverStatus POST once wait until all started
-- name: Wait until all JVMs STARTED (post)
-  shell: "{{ profile_bin }}/serverStatus.sh -all"
-  register: server_status_post
-  become: true
-  become_user: "{{ jvm_owner }}"
-  changed_when: false
-  failed_when: false
-  retries: "{{ restart_wait_retries }}"
-  delay: "{{ restart_wait_delay }}"
-  until: >-
-    {{
-      profile_jvms
-      | map('regex_escape')
-      | map('regex_replace', '^(.*)$', 'ADMU0508I: The Application Server \"\\1\" is STARTED')
-      | map('regex_search', server_status_post.stdout | default(''))
-      | select('!=', None)
-      | list
-      | length
-      == (profile_jvms | length)
-    }}
-
-# Record results per JVM
-- name: Record results for each JVM
-  block:
-    - name: Best-effort ps for pid/cell
-      shell: >-
-        {{
-          (result_jvm == 'dmgr')
-          | ternary('ps -ef | grep dmgr | grep ' ~ (profile_name | quote) ~ ' | grep -v grep',
-            (result_jvm == 'nodeagent')
-            | ternary('ps -ef | grep nodeagent | grep ' ~ (profile_name | quote) ~ ' | grep -v grep',
-              'ps -ef | grep java | grep ' ~ (result_jvm | quote) ~ ' | grep -v grep'
-            )
-          )
-        }}
-      register: ps_after_jvm
-      changed_when: false
-      failed_when: false
-
-    - name: Extract pid/cell best-effort and started_ok
-      set_fact:
-        ps_lines: "{{ ps_after_jvm.stdout_lines | default([]) }}"
-        new_pid: "{{ (ps_lines | length > 0) | ternary((ps_lines[0].split()[1]), 'not found via ps') }}"
-        cell_name: "{{ (ps_lines | length > 0) | ternary((ps_lines[0].split()[-3]), (detected_cell_name | default('unknown'))) }}"
-        started_ok: "{{ (server_status_post.stdout | default('') | regex_search('ADMU0508I: The Application Server \"' ~ (result_jvm | regex_escape) ~ '\" is STARTED')) is not none }}"
-
-    - name: Append per-JVM result
-      set_fact:
-        jvm_results: >-
-          {{
-            jvm_results + [
-              {
-                'env_name': (env_name | default('na')),
-                'env_host_profile_jvm': ((env_name | default('na')) ~ ':' ~ inventory_hostname ~ ':' ~ profile_name ~ ':' ~ result_jvm),
-                'status': ( 'success' if started_ok else 'failed' ),
-                'profile_dir': (profile_dir | default('unknown')),
-                'cell_name': (cell_name | default('unknown')),
-                'new_pid': (new_pid | default('')),
-                'action': ( 'restart' if (result_jvm in jvms_started_pre) else 'start' ),
-                'reason': ( '' if started_ok else 'Not STARTED after operations (post serverStatus)' )
-              }
-            ]
-          }}
-  loop: "{{ profile_jvms }}"
-  loop_control:
-    loop_var: result_jvm
-    label: "{{ profile_name }} -> result {{ result_jvm }}"
-3.5 Restart started JVM (dmgr/nodeagent scripts + PID lookup using profile)
-roles/websphere_jvm_restart/tasks/restart_started_jvm.yml
----
-# PID lookup special:
-# dmgr:     ps -ef | grep dmgr | grep profile_name
-# nodeagent ps -ef | grep nodeagent | grep profile_name
-# else:     ps -ef | grep java | grep jvm_name
-
-- name: Capture PID for stop/kill (special handling for dmgr/nodeagent)
-  shell: >-
-    {{
-      (started_jvm == 'dmgr')
-      | ternary(
-          'ps -ef | grep dmgr | grep ' ~ (profile_name_for_restart | quote) ~ ' | grep -v grep',
-          (started_jvm == 'nodeagent')
-          | ternary(
-              'ps -ef | grep nodeagent | grep ' ~ (profile_name_for_restart | quote) ~ ' | grep -v grep',
-              'ps -ef | grep java | grep ' ~ (started_jvm | quote) ~ ' | grep -v grep'
-          )
-      )
-    }}
-  register: ps_for_kill
-  changed_when: false
-  failed_when: false
-
-- name: Extract pid_to_kill (first matching line)
-  set_fact:
-    kill_lines: "{{ ps_for_kill.stdout_lines | default([]) }}"
-    pid_to_kill: "{{ (kill_lines | length > 0) | ternary((kill_lines[0].split()[1]), '') }}"
-
-- name: Ensure PID is known
-  assert:
-    that:
-      - pid_to_kill | length > 0
-    fail_msg: "Cannot determine PID for {{ started_jvm }} in profile {{ profile_name_for_restart }}."
-
-- name: Stop JVM (async) (dmgr/nodeagent special)
-  shell: >-
-    {{
-      (started_jvm == 'nodeagent')
-      | ternary(profile_bin_for_restart ~ '/stopNode.sh',
-        (started_jvm == 'dmgr')
-        | ternary(profile_bin_for_restart ~ '/stopManager.sh',
-          profile_bin_for_restart ~ '/stopServer.sh ' ~ started_jvm
-        )
-      )
-    }}
-  become: true
-  become_user: "{{ jvm_owner_for_restart }}"
-  async: "{{ stop_timeout_seconds }}"
-  poll: 0
-  changed_when: true
-
-- name: Wait up to timeout for PID to disappear (ps polling)
-  block:
-    - name: Poll ps until PID disappears
-      shell: "ps -ef | awk '$2=={{ pid_to_kill }} {print}'"
-      register: pid_poll
-      become: true
-      become_user: "{{ jvm_owner_for_restart }}"
-      changed_when: false
-      failed_when: false
-      retries: "{{ (stop_timeout_seconds // stop_check_delay) | int }}"
-      delay: "{{ stop_check_delay }}"
-      until: (pid_poll.stdout | default('') | trim) == ""
-  rescue:
-    - name: Kill -9 PID if still present
-      shell: "kill -9 {{ pid_to_kill }}"
-      become: true
-      become_user: "{{ jvm_owner_for_restart }}"
-      changed_when: true
-      failed_when: false
-
-    - name: Poll until PID disappears after kill -9
-      shell: "ps -ef | awk '$2=={{ pid_to_kill }} {print}'"
-      register: pid_poll_after_kill
-      become: true
-      become_user: "{{ jvm_owner_for_restart }}"
-      changed_when: false
-      failed_when: false
-      retries: 60
-      delay: 5
-      until: (pid_poll_after_kill.stdout | default('') | trim) == ""
-
-- name: Final verify PID is gone before start
-  shell: "ps -ef | awk '$2=={{ pid_to_kill }} {print}'"
-  register: pid_final_check
-  become: true
-  become_user: "{{ jvm_owner_for_restart }}"
-  changed_when: false
-  failed_when: false
-
-- name: Assert PID is gone
-  assert:
-    that:
-      - (pid_final_check.stdout | default('') | trim) == ""
-    fail_msg: "PID {{ pid_to_kill }} still exists; will not start {{ started_jvm }}."
-
-- name: Start JVM after confirmed stop (dmgr/nodeagent special)
-  shell: >-
-    {{
-      (started_jvm == 'nodeagent')
-      | ternary(profile_bin_for_restart ~ '/startNode.sh',
-        (started_jvm == 'dmgr')
-        | ternary(profile_bin_for_restart ~ '/startManager.sh',
-          profile_bin_for_restart ~ '/startServer.sh ' ~ started_jvm
-        )
-      )
-    }}
-  become: true
-  become_user: "{{ jvm_owner_for_restart }}"
-  changed_when: true
-3.6 Banner tasks (unchanged)
-roles/websphere_jvm_restart/tasks/banner_set_host.yml
----
-- name: Determine banner owner home directory
-  shell: "getent passwd {{ banner_owner }} | cut -d: -f6 || echo /home/{{ banner_owner }}"
-  register: banner_owner_home_cmd
-  changed_when: false
-  failed_when: false
-
-- name: Set banner paths
-  set_fact:
-    banner_profile_file: "{{ (banner_owner_home_cmd.stdout | trim) ~ '/' ~ restart_banner_profile_filename }}"
-    banner_status_file: "{{ (banner_owner_home_cmd.stdout | trim) ~ '/' ~ restart_banner_status_filename }}"
-
-- name: Ensure .profile prints banner when status file exists
-  blockinfile:
-    path: "{{ banner_profile_file }}"
-    create: true
-    marker: "# {mark} {{ restart_banner_block_id }}"
-    block: |
-      if [ -f "$HOME/{{ restart_banner_status_filename }}" ]; then
-        echo "############################################################"
-        cat "$HOME/{{ restart_banner_status_filename }}"
-        echo "############################################################"
-      fi
-  become: true
-  become_user: "{{ banner_owner }}"
-
-- name: Write banner status file
-  copy:
-    dest: "{{ banner_status_file }}"
-    mode: "0644"
-    content: "{{ banner_summary }}\n"
-  become: true
-  become_user: "{{ banner_owner }}"
-
-- name: Track owners touched
-  set_fact:
-    owners_touched: "{{ owners_touched | union([banner_owner]) }}"
-roles/websphere_jvm_restart/tasks/banner_cleanup.yml
----
-- name: Cleanup banner artifacts for all touched owners
-  loop: "{{ owners_touched | default([]) }}"
-  loop_control:
-    loop_var: banner_owner
-  block:
-    - name: Determine banner_owner home directory
-      shell: "getent passwd {{ banner_owner }} | cut -d: -f6 || echo /home/{{ banner_owner }}"
-      register: banner_owner_home_cmd
-      changed_when: false
-      failed_when: false
-
-    - name: Remove status file
-      file:
-        path: "{{ (banner_owner_home_cmd.stdout | trim) ~ '/' ~ restart_banner_status_filename }}"
-        state: absent
-      become: true
-      become_user: "{{ banner_owner }}"
-
-    - name: Remove managed .profile block
-      blockinfile:
-        path: "{{ (banner_owner_home_cmd.stdout | trim) ~ '/' ~ restart_banner_profile_filename }}"
-        marker: "# {mark} {{ restart_banner_block_id }}"
-        state: absent
-      become: true
-      become_user: "{{ banner_owner }}"
-3.7 Aggregate + notify (unchanged)
-roles/websphere_jvm_restart/tasks/aggregate_and_notify.yml
----
-- name: Load payload to get ritm_number
-  set_fact:
-    ws_payload: "{{ vars[role_payload_var_name] | default({}) }}"
-
-- name: Extract ritm_number
-  set_fact:
-    ritm_number: >-
-      {{
-        ws_payload.get('ritm_number')
-        or ws_payload.get('RITM number')
-        or ws_payload.get('ritmNumber')
-      }}
-
-- name: Find role dynamic groups
-  set_fact:
-    role_dyn_groups: >-
-      {{
-        (groups.keys() | list)
-        | select('match', '^' ~ (role_group_prefix | regex_escape) ~ '_')
-        | list
-      }}
-
-- name: Collect results from all hosts in role groups
-  set_fact:
-    all_jvm_results: "{{ (all_jvm_results | default([])) + (hostvars[target_host].jvm_results | default([])) }}"
-  loop: "{{ role_dyn_groups | map('extract', groups) | list | flatten }}"
-  loop_control:
-    loop_var: target_host
-    label: "{{ target_host }}"
-
-- name: Build failed_hosts list
-  set_fact:
-    failed_hosts: >-
-      {{
-        (all_jvm_results | default([])
-          | selectattr('status','equalto','failed')
-          | map(attribute='env_host_profile_jvm')
-          | list)
-      }}
-
-- name: Compute summary
-  set_fact:
-    overall_status: "{{ 'failed' if (failed_hosts | length > 0) else 'success' }}"
-    total_count: "{{ all_jvm_results | default([]) | length }}"
-    success_count: "{{ (all_jvm_results | default([]) | selectattr('status','equalto','success') | list | length) }}"
-    fail_count: "{{ failed_hosts | length }}"
-
-- name: Debug - failed_hosts
-  when: wsjvm_debug | bool
-  debug:
-    msg:
-      failed_hosts: "{{ failed_hosts }}"
-      total: "{{ total_count }}"
-      success: "{{ success_count }}"
-      failed: "{{ fail_count }}"
-
-- name: Build ServiceNow body
-  set_fact:
-    snow_body_info:
-      status: "{{ overall_status }}"
-      ritm_number: "{{ ritm_number }}"
-      failed_hosts: "{{ failed_hosts }}"
-      message: >-
-        JVM restart summary for RITM {{ ritm_number }}.
-        Total: {{ total_count }}, Success: {{ success_count }}, Failed: {{ fail_count }}.
-
-- name: Send ServiceNow update
-  include_tasks: snow_update.yml
-roles/websphere_jvm_restart/tasks/snow_update.yml
----
-- name: Validate ServiceNow endpoint settings
-  assert:
-    that:
-      - snow_instance_url | length > 0
-      - snow_update_path | length > 0
-    fail_msg: "snow_instance_url and snow_update_path must be set."
-
-- name: Build headers
-  set_fact:
-    snow_headers: >-
-      {{
-        {
-          'Accept': 'application/json',
-          'Content-Type': 'application/json'
-        }
-        | combine(
-            (snow_bearer_token | length > 0)
-            | ternary({'Authorization': 'Bearer ' ~ snow_bearer_token}, {})
-          )
-      }}
-
-- name: POST update to ServiceNow
-  uri:
-    url: "{{ snow_instance_url }}{{ snow_update_path }}"
-    method: POST
-    headers: "{{ snow_headers }}"
-    body_format: json
-    body: "{{ snow_body_info }}"
-    validate_certs: "{{ snow_validate_certs }}"
-    force_basic_auth: "{{ (snow_user | length > 0) and (snow_password | length > 0) }}"
-    user: "{{ snow_user | default(omit) }}"
-    password: "{{ snow_password | default(omit) }}"
-    status_code: [200, 201, 202, 204]
-  no_log: true
-How to enable debug and run
-
-Launch extra vars:
-
-wsjvm_debug: true
-jvm_restart:
-  ritm_number: RITM1234
-  envs:
-    dev:
-      hosts:
-        test1:
-          AppSrv01: [dmgr, nodeagent, server1]
-
-You’ll see:
-
-created groups/hosts/vars
-per profile: discovery_source ps(owner+path) vs cache(owner+path) vs ps(owner)+cache(path)
-cached root/owner values when populated
-started/stopped lists
-
-If you want the serverStatus parsing to treat dmgr/nodeagent with different output patterns (some environments show different messages), tell me what the exact serverStatus.sh -all lines look like for dmgr/nodeagent and I’ll tighten those regex checks.
+        cyberark_ccp_url: "https://ccp.company.com"
+        cyberark_app_id: "AnsibleCertAuthApp"
+        cyberark_safe: "MiddlewareSafe"
+        cyberark_user_var_names:
+          - was_user
+          - db_user
+          - mq_user
+
+    - name: Example use
+      ansible.builtin.debug:
+        msg:
+          - "was_password exists"
+          - "db_password exists"
+          - "mq_password exists"
+      no_log: true
+
+This creates:
+
+was_password: <retrieved password>
+db_password: <retrieved password>
+mq_password: <retrieved password>
+Notes
+
+The role uses the same client certificate and key from roles/cyberark_ccp_password/files/ for all lookups in that role invocation. The CyberArk module expects path-based client_cert and client_key, and the password returned by CCP is exposed in Content.
+
+If you want, I can next convert this to an AWX workflow-friendly role that also publishes the generated *_password facts through set_stats for downstream job templates.
