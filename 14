@@ -1,0 +1,16 @@
+- name: Validate dynamic group was created
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Show umbrella group hosts
+      debug:
+        msg:
+          umbrella_group: "wsjvm_restart_targets"
+          hosts: "{{ groups['wsjvm_restart_targets'] | default([]) }}"
+          host_count: "{{ (groups['wsjvm_restart_targets'] | default([])) | length }}"
+
+    - name: Fail fast if no hosts were added
+      assert:
+        that:
+          - (groups['wsjvm_restart_targets'] | default([]) | length) > 0
+        fail_msg: "No hosts added to wsjvm_restart_targets. Check payload parsing or add_host groups."
