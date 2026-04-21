@@ -1,0 +1,45 @@
+1) Add defaults to the role
+roles/websphere_jvm_restart/defaults/main.yml (ADD)
+# Remote temp settings (AIX-friendly)
+wsjvm_remote_tmp: "/tmp/.ansible/tmp"
+wsjvm_remote_tmp_mode: "1777"
+wsjvm_enable_pipelining: true
+2) Create a role task to set temp + ensure directory
+NEW: roles/websphere_jvm_restart/tasks/setup_remote_tmp.yml
+---
+- name: Set Ansible remote tmp + pipelining (per-host)
+  set_fact:
+    ansible_remote_tmp: "{{ wsjvm_remote_tmp }}"
+    ansible_ssh_pipelining: "{{ wsjvm_enable_pipelining | bool }}"
+  changed_when: false
+
+- name: Ensure Ansible remote tmp directory exists
+  file:
+    path: "{{ wsjvm_remote_tmp }}"
+    state: directory
+    mode: "{{ wsjvm_remote_tmp_mode }}"
+  become: true
+
+Why this works
+
+ansible_remote_tmp tells Ansible where to create its temp files on that host.
+ansible_ssh_pipelining reduces temp file creation.
+Directory is created with sticky-bit permissions so it’s safe.
+3) Call it at the start of remote execution
+roles/websphere_jvm_restart/tasks/execute_on_host.yml (ADD near the top)
+
+Add this after your initial “Initialize per-host tracking” section:
+
+- name: Setup remote tmp for AIX-friendly become operations
+  include_tasks: setup_remote_tmp.yml
+
+That ensures every remote host has the temp dir set before you run any stop/start/banner/serverStatus steps.
+
+4) Update file structure
+roles/websphere_jvm_restart/tasks/
+  setup_remote_tmp.yml   # NEW
+Notes / gotchas
+This applies per host, so it’s effective even when your AWX inventory is only localhost and you dynamically add hosts.
+If your SSH connection user cannot become: true (root) to create /tmp/.ansible/tmp, then create it once manually or pick a directory the SSH user can create (e.g. /tmp/<user>/.ansible/tmp).
+
+If you want, I can also add a guard so the role only runs this on AIX (detected via uname) to avoid unnecessary changes on Linux.
