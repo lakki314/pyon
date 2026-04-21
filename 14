@@ -1,24 +1,90 @@
-- name: Validate dynamic group was created
-  hosts: localhost
-  gather_facts: false
-  tasks:
-    - name: Show umbrella group hosts
-      debug:
-        msg:
-          umbrella_group: "wsjvm_restart_targets"
-          hosts: "{{ groups['wsjvm_restart_targets'] | default([]) }}"
-          host_count: "{{ (groups['wsjvm_restart_targets'] | default([])) | length }}"
+1) Updated banner_set_host.yml (NO getent, only if .profile exists)
 
-    - name: Fail fast if no hosts were added
-      assert:
-        that:
-          - (groups['wsjvm_restart_targets'] | default([]) | length) > 0
-        fail_msg: "No hosts added to wsjvm_restart_targets. Check payload parsing or add_host groups."
-- name: Debug - ps discovery summary
+File: roles/websphere_jvm_restart/tasks/banner_set_host.yml
+
+---
+# Inputs:
+#  - banner_owner
+#  - banner_summary
+#
+# Behavior:
+#  - Only set banner if /home/<owner>/.profile exists
+#  - Writes status file in /home/<owner>/
+
+- name: Check if banner owner .profile exists
+  stat:
+    path: "/home/{{ banner_owner }}/{{ restart_banner_profile_filename }}"
+  register: banner_profile_stat
+
+- name: Debug - banner profile existence
   when: wsjvm_debug | bool
   debug:
     msg:
-      profile: "{{ profile_name }}"
-      ps_discover_lines_count: "{{ ps_discover_lines | length }}"
-      ps_found: "{{ ps_found }}"
-      sample_line: "{{ (ps_discover_lines | first) if (ps_discover_lines | length > 0) else '' }}"
+      banner_owner: "{{ banner_owner }}"
+      profile_path: "/home/{{ banner_owner }}/{{ restart_banner_profile_filename }}"
+      exists: "{{ banner_profile_stat.stat.exists | default(false) }}"
+
+- name: Ensure .profile prints banner when status file exists
+  when: banner_profile_stat.stat.exists | default(false)
+  blockinfile:
+    path: "/home/{{ banner_owner }}/{{ restart_banner_profile_filename }}"
+    create: false
+    marker: "# {mark} {{ restart_banner_block_id }}"
+    block: |
+      if [ -f "$HOME/{{ restart_banner_status_filename }}" ]; then
+        echo "############################################################"
+        cat "$HOME/{{ restart_banner_status_filename }}"
+        echo "############################################################"
+      fi
+  become: true
+  become_user: "{{ banner_owner }}"
+
+- name: Write banner status file (only if .profile exists)
+  when: banner_profile_stat.stat.exists | default(false)
+  copy:
+    dest: "/home/{{ banner_owner }}/{{ restart_banner_status_filename }}"
+    mode: "0644"
+    content: "{{ banner_summary }}\n"
+  become: true
+  become_user: "{{ banner_owner }}"
+
+- name: Track owners touched (only if banner was applied)
+  when: banner_profile_stat.stat.exists | default(false)
+  set_fact:
+    owners_touched: "{{ owners_touched | union([banner_owner]) }}"
+What changed
+Removed getent
+Hardcoded path base to /home/{{ banner_owner }}
+Only sets banner if .profile exists (your requirement)
+Uses create: false so it won’t create a .profile
+2) Updated banner_cleanup.yml (NO getent, remove only if files exist)
+
+File: roles/websphere_jvm_restart/tasks/banner_cleanup.yml
+
+---
+- name: Cleanup banner artifacts for all touched owners
+  loop: "{{ owners_touched | default([]) }}"
+  loop_control:
+    loop_var: banner_owner
+  block:
+    - name: Check if banner owner .profile exists
+      stat:
+        path: "/home/{{ banner_owner }}/{{ restart_banner_profile_filename }}"
+      register: cleanup_profile_stat
+
+    - name: Remove status file (best effort)
+      file:
+        path: "/home/{{ banner_owner }}/{{ restart_banner_status_filename }}"
+        state: absent
+      become: true
+      become_user: "{{ banner_owner }}"
+      failed_when: false
+
+    - name: Remove managed .profile block (only if .profile exists)
+      when: cleanup_profile_stat.stat.exists | default(false)
+      blockinfile:
+        path: "/home/{{ banner_owner }}/{{ restart_banner_profile_filename }}"
+        marker: "# {mark} {{ restart_banner_block_id }}"
+        state: absent
+      become: true
+      become_user: "{{ banner_owner }}"
