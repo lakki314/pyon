@@ -1,0 +1,184 @@
+Changes included
+
+✅ Add ansible_host + ansible_connection during add_host
+✅ Add an umbrella group wsjvm_restart_targets for all payload hosts
+✅ Execute play now targets hosts: wsjvm_restart_targets (so inventory_hostname is real host, not localhost)
+✅ Keep env-specific groups (dev/prod) too
+
+1) Updated playbook: playbooks/auto_router.yml
+
+Only the execute play changes. Everything else stays the same.
+
+---
+- name: Detect payload and build inventory for selected automation
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    wsjvm_debug: false  # set true at launch for debug
+
+    role_registry:
+      - payload_var: "jvm_restart"
+        role_name: "websphere_jvm_restart"
+        group_prefix: "wsjvm_restart_targets"
+
+      # ---- FUTURE EXAMPLE (commented) ----
+      # - payload_var: "ihs_restart"
+      #   role_name: "ihs_restart_role"
+      #   group_prefix: "ihs_restart_targets"
+
+  tasks:
+    - name: Find which payloads are defined at launch
+      set_fact:
+        matched_specs: >-
+          {{
+            role_registry
+            | selectattr('payload_var', 'in', vars.keys() | list)
+            | list
+          }}
+
+    - name: Validate exactly one supported payload is provided
+      assert:
+        that:
+          - matched_specs | length == 1
+        fail_msg: >-
+          Expected exactly ONE supported payload at launch.
+          Supported: {{ role_registry | map(attribute='payload_var') | list }}
+          Received: {{
+            (role_registry | map(attribute='payload_var') | list)
+            | select('in', vars.keys() | list)
+            | list
+          }}
+
+    - name: Select role spec
+      set_fact:
+        selected_payload_var_name: "{{ matched_specs[0].payload_var }}"
+        selected_role_name: "{{ matched_specs[0].role_name }}"
+        selected_group_prefix: "{{ matched_specs[0].group_prefix }}"
+        wsjvm_debug_selected: "{{ wsjvm_debug | bool }}"
+
+    - name: Build dynamic inventory for selected role
+      include_role:
+        name: "{{ selected_role_name }}"
+        tasks_from: build_inventory.yml
+      vars:
+        role_payload_var_name: "{{ selected_payload_var_name }}"
+        role_group_prefix: "{{ selected_group_prefix }}"
+        wsjvm_debug: "{{ wsjvm_debug_selected }}"
+
+    # Debug created hosts/vars (unchanged)
+    - name: Debug - show hosts in umbrella group
+      when: wsjvm_debug_selected
+      debug:
+        msg:
+          umbrella_group: "wsjvm_restart_targets"
+          hosts: "{{ groups['wsjvm_restart_targets'] | default([]) }}"
+
+- name: Execute selected role on payload hosts (parallel per host)
+  hosts: wsjvm_restart_targets          # <<< CHANGED (no more hosts: all)
+  gather_facts: false
+  strategy: free
+
+  vars:
+    selected_role_name: "{{ hostvars['localhost'].selected_role_name }}"
+    selected_payload_var_name: "{{ hostvars['localhost'].selected_payload_var_name }}"
+    selected_group_prefix: "{{ hostvars['localhost'].selected_group_prefix }}"
+    wsjvm_debug_selected: "{{ hostvars['localhost'].wsjvm_debug_selected | default(false) }}"
+
+  tasks:
+    - name: Execute selected role on target hosts
+      include_role:
+        name: "{{ selected_role_name }}"
+        tasks_from: execute_on_host.yml
+      vars:
+        role_payload_var_name: "{{ selected_payload_var_name }}"
+        role_group_prefix: "{{ selected_group_prefix }}"
+        wsjvm_debug: "{{ wsjvm_debug_selected }}"
+
+- name: Aggregate results and notify ServiceNow (selected role only)
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    selected_role_name: "{{ hostvars['localhost'].selected_role_name }}"
+    selected_payload_var_name: "{{ hostvars['localhost'].selected_payload_var_name }}"
+    selected_group_prefix: "{{ hostvars['localhost'].selected_group_prefix }}"
+    wsjvm_debug_selected: "{{ hostvars['localhost'].wsjvm_debug_selected | default(false) }}"
+
+  tasks:
+    - name: Aggregate and notify for selected role
+      include_role:
+        name: "{{ selected_role_name }}"
+        tasks_from: aggregate_and_notify.yml
+      vars:
+        role_payload_var_name: "{{ selected_payload_var_name }}"
+        role_group_prefix: "{{ selected_group_prefix }}"
+        wsjvm_debug: "{{ wsjvm_debug_selected }}"
+What this fixes
+The execute play no longer includes localhost.
+Hosts come from the payload-created umbrella group.
+2) Updated role YAML: roles/websphere_jvm_restart/tasks/build_one_host.yml
+
+This is the critical change for “inventory has only localhost”.
+
+✅ Adds hosts into:
+
+umbrella group: wsjvm_restart_targets
+env group: {{ role_group_prefix }}_{{ env_name }}
+
+✅ Adds connection vars:
+
+ansible_host
+ansible_connection: ssh
+---
+- name: Initialize restart_requests
+  set_fact:
+    restart_requests: []
+
+- name: Convert profiles map to list
+  set_fact:
+    profile_specs: "{{ host_spec.value | dict2items }}"
+
+- name: Append profile/jvm pairs
+  include_tasks: append_profile_jvms.yml
+  loop: "{{ profile_specs }}"
+  loop_control:
+    loop_var: profile_spec
+    label: "{{ env_name }} -> {{ host_spec.key }} -> {{ profile_spec.key }}"
+
+- name: Add host to dynamic groups with connection vars
+  add_host:
+    name: "{{ host_spec.key }}"
+    groups:
+      - "wsjvm_restart_targets"                 # umbrella group for execute play
+      - "{{ role_group_prefix }}_{{ env_name }}" # env group (dev/prod/etc)
+    ansible_host: "{{ host_spec.key }}"          # resolves via DNS / hosts file
+    ansible_connection: "ssh"
+    # ansible_port: 22                          # optional if non-standard
+    ritm_number: "{{ ritm_number }}"
+    env_name: "{{ env_name }}"
+    restart_requests: "{{ restart_requests }}"
+3) What you must set in AWX Job Template (important)
+Inventory: your “localhost-only” inventory is fine
+Machine Credential: must be a valid SSH credential for the remote hosts
+Limit: empty
+Ask limit on launch: OFF
+Quick validation
+
+Turn on debug at launch:
+
+wsjvm_debug: true
+jvm_restart:
+  ritm_number: RITM1234
+  envs:
+    dev:
+      hosts:
+        test1:
+          AppSrv01: [server1]
+
+You should see:
+
+umbrella group hosts: [test1]
+execute play runs with inventory_hostname = test1
+
+If you want, I can also update the debug section in the router playbook to print each created host’s ansible_host/ansible_connection to confirm connections are set correctly.
