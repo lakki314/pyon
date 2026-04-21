@@ -1,37 +1,155 @@
-NEW: roles/websphere_jvm_restart/tasks/banner_cleanup_one_owner.yml
-
-This file performs cleanup for exactly one banner_owner.
-
 ---
-# Expects: banner_owner
+# roles/websphere_jvm_restart/tasks/restart_started_jvm.yml
+#
+# Restart a JVM that is currently STARTED:
+# 1) Determine PID (dmgr/nodeagent/profile filter; AppServer uses java+jvm)
+# 2) Stop as jvm owner using: sudo su - <owner> -c "nohup ... &"   (NO Ansible async)
+# 3) Poll until PID disappears (up to stop_timeout_seconds)
+# 4) If still present, kill -9 and poll again
+# 5) Verify PID gone
+# 6) Start using the correct script (dmgr/nodeagent/appserver) as jvm owner via sudo su -
+#
+# Required vars:
+#   started_jvm
+#   profile_name_for_restart
+#   profile_bin_for_restart
+#   jvm_owner_for_restart
+#   stop_timeout_seconds
+#   stop_check_delay
 
-- name: Check if banner owner .profile exists
-  stat:
-    path: "/home/{{ banner_owner }}/{{ restart_banner_profile_filename }}"
-  register: cleanup_profile_stat
+- name: Initialize kill lookup vars
+  set_fact:
+    pid_to_kill: ""
+    _pid_lines: []
 
-- name: Remove status file (best effort)
-  file:
-    path: "/home/{{ banner_owner }}/{{ restart_banner_status_filename }}"
-    state: absent
+# ----- PID lookup (3 tasks) -----
+- name: Capture PID for DMGR
+  shell: "ps -ef | grep dmgr | grep {{ profile_name_for_restart | quote }} | grep -v grep"
+  register: _ps_kill
+  changed_when: false
+  failed_when: false
+  when: started_jvm == 'dmgr'
+
+- name: Capture PID for NODEAGENT
+  shell: "ps -ef | grep nodeagent | grep {{ profile_name_for_restart | quote }} | grep -v grep"
+  register: _ps_kill
+  changed_when: false
+  failed_when: false
+  when: started_jvm == 'nodeagent'
+
+- name: Capture PID for AppServer
+  shell: "ps -ef | grep java | grep {{ started_jvm | quote }} | grep -v grep"
+  register: _ps_kill
+  changed_when: false
+  failed_when: false
+  when: started_jvm not in ['dmgr','nodeagent']
+
+- name: Extract pid_to_kill (first line)
+  set_fact:
+    _pid_lines: "{{ _ps_kill.stdout_lines | default([]) }}"
+    pid_to_kill: "{{ (_pid_lines | length > 0) | ternary((_pid_lines[0].split()[1]), '') }}"
+
+- name: Ensure PID is known
+  assert:
+    that:
+      - pid_to_kill | length > 0
+    fail_msg: "Cannot determine PID for {{ started_jvm }} in profile {{ profile_name_for_restart }}."
+
+# ----- STOP (3 tasks) WITHOUT Ansible async (AIX-safe) -----
+# Run stop as jvm owner using sudo su -, background it so the task doesn't hang.
+# PID polling below enforces the 10-minute stop rule and kill -9 fallback.
+
+- name: Stop NODEAGENT (sudo su - jvm_owner, background)
+  shell: >-
+    sudo su - {{ jvm_owner_for_restart }} -c
+    "nohup {{ profile_bin_for_restart }}/stopNode.sh >/tmp/stopNode_{{ profile_name_for_restart }}.log 2>&1 &"
   become: true
+  changed_when: true
+  failed_when: false
+  when: started_jvm == 'nodeagent'
+
+- name: Stop DMGR (sudo su - jvm_owner, background)
+  shell: >-
+    sudo su - {{ jvm_owner_for_restart }} -c
+    "nohup {{ profile_bin_for_restart }}/stopManager.sh >/tmp/stopMgr_{{ profile_name_for_restart }}.log 2>&1 &"
+  become: true
+  changed_when: true
+  failed_when: false
+  when: started_jvm == 'dmgr'
+
+- name: Stop AppServer (sudo su - jvm_owner, background)
+  shell: >-
+    sudo su - {{ jvm_owner_for_restart }} -c
+    "nohup {{ profile_bin_for_restart }}/stopServer.sh {{ started_jvm }} >/tmp/stopSrv_{{ profile_name_for_restart }}_{{ started_jvm }}.log 2>&1 &"
+  become: true
+  changed_when: true
+  failed_when: false
+  when: started_jvm not in ['dmgr','nodeagent']
+
+# ----- PID polling / kill -9 -----
+- name: Wait up to timeout for PID to disappear (ps polling)
+  block:
+    - name: Poll ps until PID disappears
+      shell: "ps -ef | awk '$2=={{ pid_to_kill }} {print}'"
+      register: pid_poll
+      become: true
+      changed_when: false
+      failed_when: false
+      retries: "{{ (stop_timeout_seconds // stop_check_delay) | int }}"
+      delay: "{{ stop_check_delay }}"
+      until: (pid_poll.stdout | default('') | trim) == ""
+  rescue:
+    - name: Kill -9 PID if still present
+      shell: "kill -9 {{ pid_to_kill }}"
+      become: true
+      changed_when: true
+      failed_when: false
+
+    - name: Poll until PID disappears after kill -9
+      shell: "ps -ef | awk '$2=={{ pid_to_kill }} {print}'"
+      register: pid_poll_after_kill
+      become: true
+      changed_when: false
+      failed_when: false
+      retries: 60
+      delay: 5
+      until: (pid_poll_after_kill.stdout | default('') | trim) == ""
+
+- name: Final verify PID is gone before start
+  shell: "ps -ef | awk '$2=={{ pid_to_kill }} {print}'"
+  register: pid_final_check
+  become: true
+  changed_when: false
   failed_when: false
 
-- name: Remove managed .profile block (only if .profile exists)
-  when: cleanup_profile_stat.stat.exists | default(false)
-  blockinfile:
-    path: "/home/{{ banner_owner }}/{{ restart_banner_profile_filename }}"
-    marker: "# {mark} {{ restart_banner_block_id }}"
-    state: absent
+- name: Assert PID is gone
+  assert:
+    that:
+      - (pid_final_check.stdout | default('') | trim) == ""
+    fail_msg: "PID {{ pid_to_kill }} still exists; will not start {{ started_jvm }}."
+
+# ----- START (3 tasks) as jvm owner via sudo su - -----
+
+- name: Start NODEAGENT (sudo su - jvm_owner)
+  shell: >-
+    sudo su - {{ jvm_owner_for_restart }} -c
+    "{{ profile_bin_for_restart }}/startNode.sh"
   become: true
-UPDATED: roles/websphere_jvm_restart/tasks/banner_cleanup.yml
+  changed_when: true
+  when: started_jvm == 'nodeagent'
 
-No block loop anymore — it loops the include.
+- name: Start DMGR (sudo su - jvm_owner)
+  shell: >-
+    sudo su - {{ jvm_owner_for_restart }} -c
+    "{{ profile_bin_for_restart }}/startManager.sh"
+  become: true
+  changed_when: true
+  when: started_jvm == 'dmgr'
 
----
-- name: Cleanup banner artifacts for all touched owners (include_tasks loop)
-  include_tasks: banner_cleanup_one_owner.yml
-  loop: "{{ owners_touched | default([]) }}"
-  loop_control:
-    loop_var: banner_owner
-    label: "cleanup banner for {{ banner_owner }}"
+- name: Start AppServer (sudo su - jvm_owner)
+  shell: >-
+    sudo su - {{ jvm_owner_for_restart }} -c
+    "{{ profile_bin_for_restart }}/startServer.sh {{ started_jvm }}"
+  become: true
+  changed_when: true
+  when: started_jvm not in ['dmgr','nodeagent']
