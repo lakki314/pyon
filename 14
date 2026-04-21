@@ -1,15 +1,10 @@
-1) Updated banner_set_host.yml (NO getent, only if .profile exists)
-
-File: roles/websphere_jvm_restart/tasks/banner_set_host.yml
-
 ---
 # Inputs:
 #  - banner_owner
 #  - banner_summary
-#
 # Behavior:
 #  - Only set banner if /home/<owner>/.profile exists
-#  - Writes status file in /home/<owner>/
+#  - Do NOT become_user (AIX temp chmod issue). Use root + owner/group.
 
 - name: Check if banner owner .profile exists
   stat:
@@ -37,29 +32,27 @@ File: roles/websphere_jvm_restart/tasks/banner_set_host.yml
         echo "############################################################"
       fi
   become: true
-  become_user: "{{ banner_owner }}"
 
 - name: Write banner status file (only if .profile exists)
   when: banner_profile_stat.stat.exists | default(false)
   copy:
     dest: "/home/{{ banner_owner }}/{{ restart_banner_status_filename }}"
-    mode: "0644"
     content: "{{ banner_summary }}\n"
+    owner: "{{ banner_owner }}"
+    group: "{{ banner_profile_stat.stat.gr_name | default(banner_owner) }}"
+    mode: "0644"
   become: true
-  become_user: "{{ banner_owner }}"
 
 - name: Track owners touched (only if banner was applied)
   when: banner_profile_stat.stat.exists | default(false)
   set_fact:
     owners_touched: "{{ owners_touched | union([banner_owner]) }}"
-What changed
-Removed getent
-Hardcoded path base to /home/{{ banner_owner }}
-Only sets banner if .profile exists (your requirement)
-Uses create: false so it won’t create a .profile
-2) Updated banner_cleanup.yml (NO getent, remove only if files exist)
+Why this works
+copy and blockinfile run as root so Ansible can create temp files safely
+ownership is applied explicitly (owner, group), so file ends up belonging to jvm_owner
+2) Update banner_cleanup.yml (NO become_user, remove as root)
 
-File: roles/websphere_jvm_restart/tasks/banner_cleanup.yml
+roles/websphere_jvm_restart/tasks/banner_cleanup.yml
 
 ---
 - name: Cleanup banner artifacts for all touched owners
@@ -77,7 +70,6 @@ File: roles/websphere_jvm_restart/tasks/banner_cleanup.yml
         path: "/home/{{ banner_owner }}/{{ restart_banner_status_filename }}"
         state: absent
       become: true
-      become_user: "{{ banner_owner }}"
       failed_when: false
 
     - name: Remove managed .profile block (only if .profile exists)
@@ -87,4 +79,3 @@ File: roles/websphere_jvm_restart/tasks/banner_cleanup.yml
         marker: "# {mark} {{ restart_banner_block_id }}"
         state: absent
       become: true
-      become_user: "{{ banner_owner }}"
