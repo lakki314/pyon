@@ -1,81 +1,37 @@
+NEW: roles/websphere_jvm_restart/tasks/banner_cleanup_one_owner.yml
+
+This file performs cleanup for exactly one banner_owner.
+
 ---
-# Inputs:
-#  - banner_owner
-#  - banner_summary
-# Behavior:
-#  - Only set banner if /home/<owner>/.profile exists
-#  - Do NOT become_user (AIX temp chmod issue). Use root + owner/group.
+# Expects: banner_owner
 
 - name: Check if banner owner .profile exists
   stat:
     path: "/home/{{ banner_owner }}/{{ restart_banner_profile_filename }}"
-  register: banner_profile_stat
+  register: cleanup_profile_stat
 
-- name: Debug - banner profile existence
-  when: wsjvm_debug | bool
-  debug:
-    msg:
-      banner_owner: "{{ banner_owner }}"
-      profile_path: "/home/{{ banner_owner }}/{{ restart_banner_profile_filename }}"
-      exists: "{{ banner_profile_stat.stat.exists | default(false) }}"
+- name: Remove status file (best effort)
+  file:
+    path: "/home/{{ banner_owner }}/{{ restart_banner_status_filename }}"
+    state: absent
+  become: true
+  failed_when: false
 
-- name: Ensure .profile prints banner when status file exists
-  when: banner_profile_stat.stat.exists | default(false)
+- name: Remove managed .profile block (only if .profile exists)
+  when: cleanup_profile_stat.stat.exists | default(false)
   blockinfile:
     path: "/home/{{ banner_owner }}/{{ restart_banner_profile_filename }}"
-    create: false
     marker: "# {mark} {{ restart_banner_block_id }}"
-    block: |
-      if [ -f "$HOME/{{ restart_banner_status_filename }}" ]; then
-        echo "############################################################"
-        cat "$HOME/{{ restart_banner_status_filename }}"
-        echo "############################################################"
-      fi
+    state: absent
   become: true
+UPDATED: roles/websphere_jvm_restart/tasks/banner_cleanup.yml
 
-- name: Write banner status file (only if .profile exists)
-  when: banner_profile_stat.stat.exists | default(false)
-  copy:
-    dest: "/home/{{ banner_owner }}/{{ restart_banner_status_filename }}"
-    content: "{{ banner_summary }}\n"
-    owner: "{{ banner_owner }}"
-    group: "{{ banner_profile_stat.stat.gr_name | default(banner_owner) }}"
-    mode: "0644"
-  become: true
-
-- name: Track owners touched (only if banner was applied)
-  when: banner_profile_stat.stat.exists | default(false)
-  set_fact:
-    owners_touched: "{{ owners_touched | union([banner_owner]) }}"
-Why this works
-copy and blockinfile run as root so Ansible can create temp files safely
-ownership is applied explicitly (owner, group), so file ends up belonging to jvm_owner
-2) Update banner_cleanup.yml (NO become_user, remove as root)
-
-roles/websphere_jvm_restart/tasks/banner_cleanup.yml
+No block loop anymore — it loops the include.
 
 ---
-- name: Cleanup banner artifacts for all touched owners
+- name: Cleanup banner artifacts for all touched owners (include_tasks loop)
+  include_tasks: banner_cleanup_one_owner.yml
   loop: "{{ owners_touched | default([]) }}"
   loop_control:
     loop_var: banner_owner
-  block:
-    - name: Check if banner owner .profile exists
-      stat:
-        path: "/home/{{ banner_owner }}/{{ restart_banner_profile_filename }}"
-      register: cleanup_profile_stat
-
-    - name: Remove status file (best effort)
-      file:
-        path: "/home/{{ banner_owner }}/{{ restart_banner_status_filename }}"
-        state: absent
-      become: true
-      failed_when: false
-
-    - name: Remove managed .profile block (only if .profile exists)
-      when: cleanup_profile_stat.stat.exists | default(false)
-      blockinfile:
-        path: "/home/{{ banner_owner }}/{{ restart_banner_profile_filename }}"
-        marker: "# {mark} {{ restart_banner_block_id }}"
-        state: absent
-      become: true
+    label: "cleanup banner for {{ banner_owner }}"
