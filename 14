@@ -14,3 +14,11 @@
         that:
           - (groups['wsjvm_restart_targets'] | default([]) | length) > 0
         fail_msg: "No hosts added to wsjvm_restart_targets. Check payload parsing or add_host groups."
+- name: Debug - ps discovery summary
+  when: wsjvm_debug | bool
+  debug:
+    msg:
+      profile: "{{ profile_name }}"
+      ps_discover_lines_count: "{{ ps_discover_lines | length }}"
+      ps_found: "{{ ps_found }}"
+      sample_line: "{{ (ps_discover_lines | first) if (ps_discover_lines | length > 0) else '' }}"
