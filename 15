@@ -1,0 +1,1104 @@
+Below is the complete updated playbook + complete updated role with all the changes you asked for:
+
+✅ No ternary for dmgr/nodeagent/AppServer logic (split into 3 conditional tasks)
+✅ stop/start runs as become_user: jvm_owner (same style as serverStatus.sh)
+✅ ps discovery + PID lookup use your rules:
+
+dmgr: ps -ef | grep dmgr | grep profile_name
+nodeagent: ps -ef | grep nodeagent | grep profile_name
+AppServer: ps -ef | grep java | grep jvm_name
+✅ serverStatus stays as-is (works for you)
+✅ inventory-only localhost supported:
+dynamic hosts added with add_host and ansible_host/ansible_connection
+umbrella group: wsjvm_restart_targets
+execute play runs on hosts: wsjvm_restart_targets
+✅ Fix for “loop over block”: results recording moved to record_one_jvm.yml and invoked with include_tasks + loop
+✅ Banner: no getent; only set if /home/<owner>/.profile exists; executed as root (avoids AIX temp chmod errors)
+✅ Debug: wsjvm_debug: true prints created hosts, per-profile discovery source, etc.
+File structure
+playbooks/
+  auto_router.yml
+
+roles/
+  websphere_jvm_restart/
+    defaults/
+      main.yml
+    tasks/
+      build_inventory.yml
+      build_one_env.yml
+      build_one_host.yml            # UPDATED (umbrella group + ansible_host + groups string)
+      append_profile_jvms.yml
+
+      execute_on_host.yml
+      restart_profile.yml           # UPDATED (no ternary, uses include tasks)
+      ps_discover_one.yml           # NEW (no ternary ps discovery)
+      start_one_jvm.yml             # NEW (no ternary start)
+      restart_started_jvm.yml       # UPDATED (no ternary, become_user stop/start)
+      record_one_jvm.yml            # UPDATED (no ternary ps after)
+
+      banner_set_host.yml           # UPDATED (no getent, root write, only if .profile exists)
+      banner_cleanup.yml            # UPDATED (no getent, root cleanup)
+
+      aggregate_and_notify.yml
+      snow_update.yml
+Playbook
+playbooks/auto_router.yml (UPDATED)
+What changed
+Execute play now targets only wsjvm_restart_targets, so it won’t run on localhost and won’t show “localhost” as the host.
+---
+- name: Detect payload and build inventory for selected automation
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    wsjvm_debug: false  # set true at launch for debug
+
+    role_registry:
+      - payload_var: "jvm_restart"
+        role_name: "websphere_jvm_restart"
+        group_prefix: "wsjvm_restart_targets"
+
+  tasks:
+    - name: Find which payloads are defined at launch
+      set_fact:
+        matched_specs: >-
+          {{
+            role_registry
+            | selectattr('payload_var', 'in', vars.keys() | list)
+            | list
+          }}
+
+    - name: Validate exactly one supported payload is provided
+      assert:
+        that:
+          - matched_specs | length == 1
+        fail_msg: >-
+          Expected exactly ONE supported payload at launch.
+          Supported: {{ role_registry | map(attribute='payload_var') | list }}
+          Received: {{
+            (role_registry | map(attribute='payload_var') | list)
+            | select('in', vars.keys() | list)
+            | list
+          }}
+
+    - name: Select role spec
+      set_fact:
+        selected_payload_var_name: "{{ matched_specs[0].payload_var }}"
+        selected_role_name: "{{ matched_specs[0].role_name }}"
+        selected_group_prefix: "{{ matched_specs[0].group_prefix }}"
+        wsjvm_debug_selected: "{{ wsjvm_debug | bool }}"
+
+    - name: Build dynamic inventory for selected role
+      include_role:
+        name: "{{ selected_role_name }}"
+        tasks_from: build_inventory.yml
+      vars:
+        role_payload_var_name: "{{ selected_payload_var_name }}"
+        role_group_prefix: "{{ selected_group_prefix }}"
+        wsjvm_debug: "{{ wsjvm_debug_selected }}"
+
+    - name: Debug - umbrella group hosts after build
+      when: wsjvm_debug_selected
+      debug:
+        msg:
+          umbrella_group: "wsjvm_restart_targets"
+          hosts: "{{ groups['wsjvm_restart_targets'] | default([]) }}"
+          host_count: "{{ (groups['wsjvm_restart_targets'] | default([])) | length }}"
+
+    - name: Fail fast if no hosts were added
+      assert:
+        that:
+          - (groups['wsjvm_restart_targets'] | default([]) | length) > 0
+        fail_msg: "No hosts added to wsjvm_restart_targets. Check payload parsing or add_host."
+
+- name: Execute selected role on payload hosts (parallel per host)
+  hosts: wsjvm_restart_targets
+  gather_facts: false
+  strategy: free
+
+  vars:
+    selected_role_name: "{{ hostvars['localhost'].selected_role_name }}"
+    wsjvm_debug_selected: "{{ hostvars['localhost'].wsjvm_debug_selected | default(false) }}"
+
+  tasks:
+    - name: Execute selected role on target hosts
+      include_role:
+        name: "{{ selected_role_name }}"
+        tasks_from: execute_on_host.yml
+      vars:
+        wsjvm_debug: "{{ wsjvm_debug_selected }}"
+
+- name: Aggregate results and notify ServiceNow (selected role only)
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    selected_role_name: "{{ hostvars['localhost'].selected_role_name }}"
+    selected_payload_var_name: "{{ hostvars['localhost'].selected_payload_var_name }}"
+    selected_group_prefix: "{{ hostvars['localhost'].selected_group_prefix }}"
+    wsjvm_debug_selected: "{{ hostvars['localhost'].wsjvm_debug_selected | default(false) }}"
+
+  tasks:
+    - name: Aggregate and notify for selected role
+      include_role:
+        name: "{{ selected_role_name }}"
+        tasks_from: aggregate_and_notify.yml
+      vars:
+        role_payload_var_name: "{{ selected_payload_var_name }}"
+        role_group_prefix: "{{ selected_group_prefix }}"
+        wsjvm_debug: "{{ wsjvm_debug_selected }}"
+Role: websphere_jvm_restart
+roles/websphere_jvm_restart/defaults/main.yml (UPDATED)
+---
+role_payload_var_name: "jvm_restart"
+role_group_prefix: "wsjvm_restart_targets"
+
+wsjvm_debug: false
+
+restart_wait_retries: 30
+restart_wait_delay: 10
+
+stop_timeout_seconds: 600
+stop_check_delay: 15
+
+was_install_roots:
+  - "/opt/wps8/websphere/AppServer/85/"
+  - "/opt/websphere/85/commonprofile/AppServer"
+  - "/opt/websphere/90/commonprofile/AppServer"
+  - "/opt/websphere/85/AppServer/"
+
+restart_banner_enabled: true
+restart_banner_status_filename: ".was_jvm_restart_status"
+restart_banner_profile_filename: ".profile"
+restart_banner_block_id: "ANSIBLE MANAGED - WAS JVM RESTART BANNER"
+
+snow_instance_url: ""
+snow_update_path: ""
+snow_validate_certs: true
+snow_user: ""
+snow_password: ""
+snow_bearer_token: ""
+Build inventory YAMLs
+tasks/build_inventory.yml
+---
+- name: Load payload
+  set_fact:
+    ws_payload: "{{ vars[role_payload_var_name] | default({}) }}"
+
+- name: Validate payload exists
+  assert:
+    that:
+      - ws_payload is mapping
+      - ws_payload | length > 0
+    fail_msg: "Payload var '{{ role_payload_var_name }}' is missing or empty."
+
+- name: Extract ritm_number
+  set_fact:
+    ritm_number: >-
+      {{
+        ws_payload.get('ritm_number')
+        or ws_payload.get('RITM number')
+        or ws_payload.get('ritmNumber')
+      }}
+
+- name: Validate ritm_number
+  assert:
+    that:
+      - ritm_number is defined
+      - ritm_number | length > 0
+    fail_msg: "ritm_number is missing in '{{ role_payload_var_name }}'."
+
+- name: Extract envs map
+  set_fact:
+    envs_map: "{{ ws_payload.get('envs', {}) }}"
+
+- name: Validate envs map
+  assert:
+    that:
+      - envs_map is mapping
+      - envs_map | length > 0
+    fail_msg: "payload.envs is missing/empty in '{{ role_payload_var_name }}'."
+
+- name: Convert envs map to list
+  set_fact:
+    env_specs: "{{ envs_map | dict2items }}"
+
+- name: Build dynamic inventory per env
+  include_tasks: build_one_env.yml
+  loop: "{{ env_specs }}"
+  loop_control:
+    loop_var: env_spec
+    label: "{{ env_spec.key }}"
+tasks/build_one_env.yml
+---
+- name: Set env context
+  set_fact:
+    env_name: "{{ env_spec.key }}"
+    env_hosts_map: "{{ env_spec.value.get('hosts', {}) }}"
+
+- name: Validate env hosts
+  assert:
+    that:
+      - env_hosts_map is mapping
+      - env_hosts_map | length > 0
+    fail_msg: "No hosts under env {{ env_name }}."
+
+- name: Convert host map to list
+  set_fact:
+    host_specs: "{{ env_hosts_map | dict2items }}"
+
+- name: Build inventory entries per host
+  include_tasks: build_one_host.yml
+  loop: "{{ host_specs }}"
+  loop_control:
+    loop_var: host_spec
+    label: "{{ env_name }} -> {{ host_spec.key }}"
+tasks/build_one_host.yml (UPDATED)
+
+✅ Umbrella group + env group
+✅ Ansible 2.9-safe groups string
+✅ Adds ansible_host/ansible_connection so remote SSH works even if inventory only has localhost.
+
+---
+- name: Initialize restart_requests
+  set_fact:
+    restart_requests: []
+
+- name: Convert profiles map to list
+  set_fact:
+    profile_specs: "{{ host_spec.value | dict2items }}"
+
+- name: Append profile/jvm pairs
+  include_tasks: append_profile_jvms.yml
+  loop: "{{ profile_specs }}"
+  loop_control:
+    loop_var: profile_spec
+    label: "{{ env_name }} -> {{ host_spec.key }} -> {{ profile_spec.key }}"
+
+- name: Add host to dynamic groups with connection vars
+  add_host:
+    name: "{{ host_spec.key }}"
+    groups: "wsjvm_restart_targets,{{ role_group_prefix }}_{{ env_name }}"
+    ansible_host: "{{ host_spec.key }}"
+    ansible_connection: "ssh"
+    ritm_number: "{{ ritm_number }}"
+    env_name: "{{ env_name }}"
+    restart_requests: "{{ restart_requests }}"
+tasks/append_profile_jvms.yml
+---
+- name: Append JVMs for this profile
+  set_fact:
+    restart_requests: "{{ restart_requests + [ {'profile_name': profile_spec.key, 'jvm_name': jvm_name_entry} ] }}"
+  loop: "{{ profile_spec.value | default([]) }}"
+  loop_control:
+    loop_var: jvm_name_entry
+    label: "{{ profile_spec.key }} -> {{ jvm_name_entry }}"
+Execute YAMLs
+tasks/execute_on_host.yml (UPDATED only by banner guard default)
+---
+- name: Initialize per-host tracking
+  set_fact:
+    jvm_results: "{{ jvm_results | default([]) }}"
+    owners_touched: "{{ owners_touched | default([]) }}"
+    cached_install_root: "{{ cached_install_root | default('') }}"
+    cached_install_owner: "{{ cached_install_owner | default('') }}"
+
+- name: Debug - host received vars
+  when: wsjvm_debug | bool
+  debug:
+    msg:
+      host: "{{ inventory_hostname }}"
+      env_name: "{{ env_name | default('') }}"
+      ritm_number: "{{ ritm_number | default('') }}"
+      restart_requests_count: "{{ (restart_requests | default([])) | length }}"
+
+- name: Validate restart_requests exist
+  assert:
+    that:
+      - restart_requests is defined
+      - restart_requests is sequence
+      - restart_requests | length > 0
+    fail_msg: "No restart_requests on {{ inventory_hostname }}."
+
+- name: Initialize profile_map
+  set_fact:
+    profile_map: {}
+
+- name: Build profile_map {profile_name: [jvm1,jvm2,...]}
+  set_fact:
+    profile_map: "{{ profile_map | combine({ req_profile: (profile_map.get(req_profile, []) + [req_jvm]) }) }}"
+  vars:
+    req_profile: "{{ req_entry.profile_name }}"
+    req_jvm: "{{ req_entry.jvm_name }}"
+  loop: "{{ restart_requests }}"
+  loop_control:
+    loop_var: req_entry
+    label: "{{ req_entry.profile_name }} -> {{ req_entry.jvm_name }}"
+
+- name: Convert profile_map to list
+  set_fact:
+    profile_specs: "{{ profile_map | dict2items }}"
+
+- name: Process each profile (serverStatus once pre and once post)
+  block:
+    - name: Restart JVMs for one profile
+      include_tasks: restart_profile.yml
+      loop: "{{ profile_specs }}"
+      loop_control:
+        loop_var: profile_spec
+        label: "{{ env_name | default('na') }}:{{ inventory_hostname }} -> {{ profile_spec.key }}"
+  always:
+    - name: Cleanup banners (always)
+      include_tasks: banner_cleanup.yml
+      when: (restart_banner_enabled | default(true)) | bool
+tasks/restart_profile.yml (UPDATED)
+
+✅ No ternary for ps discovery or start
+✅ Uses ps_discover_one.yml and start_one_jvm.yml
+✅ Uses restart_started_jvm.yml (already split)
+✅ Uses record_one_jvm.yml to avoid loop-over-block
+✅ ps vs cache logic preserved (running → ps for owner; path: app servers from ps last-4-words, dmgr/nodeagent uses cache path)
+
+---
+- name: Set profile vars for this batch
+  set_fact:
+    profile_name: "{{ profile_spec.key }}"
+    profile_jvms: "{{ profile_spec.value | default([]) }}"
+
+- name: Validate JVM list for profile
+  assert:
+    that:
+      - profile_jvms is sequence
+      - profile_jvms | length > 0
+    fail_msg: "No JVMs for profile {{ profile_name }} on {{ inventory_hostname }}."
+
+# ---- PS discovery (no ternary) ----
+- name: Initialize discovery vars
+  set_fact:
+    ps_discover_lines_accum: []
+    ps_discover_lines: []
+    ps_found_now: false
+    has_special: false
+    discovery_source: ""
+    detected_cell_name: "unknown"
+
+- name: PS discovery per JVM (dmgr/nodeagent/profile filter)
+  include_tasks: ps_discover_one.yml
+  loop: "{{ profile_jvms }}"
+  loop_control:
+    loop_var: discover_jvm
+    label: "{{ profile_name }} -> ps check {{ discover_jvm }}"
+
+- name: Normalize ps_discover_lines
+  set_fact:
+    ps_discover_lines: >-
+      {{
+        ps_discover_lines_accum
+        | select('string')
+        | map('trim')
+        | reject('equalto','')
+        | list
+      }}
+
+- name: Compute ps_found_now
+  set_fact:
+    ps_found_now: "{{ (ps_discover_lines | length) | int > 0 }}"
+
+- name: Determine if profile includes dmgr/nodeagent
+  set_fact:
+    has_special: "{{ (profile_jvms | intersect(['dmgr','nodeagent']) | length) > 0 }}"
+
+# ---- If ps found: owner from ps; path differs based on special ----
+- name: If ps found, derive owner and path
+  when: ps_found_now
+  block:
+    - name: Set jvm_owner from ps
+      set_fact:
+        ps_words: "{{ ps_discover_lines[0].split() }}"
+        jvm_owner: "{{ ps_words[0] }}"
+
+    - name: If special (dmgr/nodeagent), use cache for profile path
+      when: has_special
+      block:
+        - set_fact:
+            discovery_source: "ps(owner)+cache(path)"
+
+        - name: Populate cache only if empty
+          when: cached_install_root | length == 0
+          block:
+            - name: Check install roots
+              stat:
+                path: "{{ install_root }}"
+              loop: "{{ was_install_roots }}"
+              loop_control:
+                loop_var: install_root
+              register: install_root_stats
+
+            - name: Select first existing install root
+              set_fact:
+                cached_install_root: >-
+                  {{
+                    (install_root_stats.results
+                      | selectattr('stat.exists','equalto',true)
+                      | map(attribute='install_root')
+                      | list
+                      | first) | default('')
+                  }}
+
+            - name: Fail if no install root exists
+              assert:
+                that:
+                  - cached_install_root | length > 0
+                fail_msg: "No WebSphere install root found on {{ inventory_hostname }}."
+
+            - name: Determine cached owner
+              stat:
+                path: "{{ cached_install_root }}"
+              register: cached_root_stat
+
+            - set_fact:
+                cached_install_owner: "{{ cached_root_stat.stat.pw_name | default('') }}"
+            - when: cached_install_owner | length == 0
+              block:
+                - shell: "ls -ld {{ cached_install_root }} | awk '{print $3}'"
+                  register: cached_owner_cmd
+                  changed_when: false
+                - set_fact:
+                    cached_install_owner: "{{ cached_owner_cmd.stdout | trim }}"
+
+        - set_fact:
+            profile_dir: "{{ (cached_install_root | regex_replace('\\/$', '')) ~ '/profiles/' ~ profile_name }}"
+            profile_bin: "{{ (cached_install_root | regex_replace('\\/$', '')) ~ '/profiles/' ~ profile_name ~ '/bin' }}"
+            detected_cell_name: "unknown"
+
+        - name: Validate profile_dir exists
+          stat:
+            path: "{{ profile_dir }}"
+          register: profile_dir_stat
+        - assert:
+            that:
+              - profile_dir_stat.stat.exists
+            fail_msg: "Profile path not found: {{ profile_dir }}"
+
+    - name: If not special (AppServer), derive profile path from ps last-4-words rule
+      when: not has_special
+      block:
+        - set_fact:
+            discovery_source: "ps(owner+path)"
+            detected_config_path: "{{ ps_words[-4] }}"
+            detected_cell_name: "{{ ps_words[-3] }}"
+            detected_profile_name: "{{ ps_words[-2] }}"
+
+        - name: Validate ps-derived profile matches
+          assert:
+            that:
+              - detected_profile_name == profile_name
+            fail_msg: "ps-derived profile {{ detected_profile_name }} != payload profile {{ profile_name }}"
+
+        - set_fact:
+            profile_dir: "{{ detected_config_path | regex_replace('\\/config$', '') }}"
+            profile_bin: "{{ (detected_config_path | regex_replace('\\/config$', '')) ~ '/bin' }}"
+
+# ---- If ps NOT found: owner+path from cache ----
+- name: If no ps found, derive owner+path from cache
+  when: not ps_found_now
+  block:
+    - set_fact:
+        discovery_source: "cache(owner+path)"
+
+    - name: Populate cache only if empty
+      when: cached_install_root | length == 0
+      block:
+        - name: Check install roots
+          stat:
+            path: "{{ install_root }}"
+          loop: "{{ was_install_roots }}"
+          loop_control:
+            loop_var: install_root
+          register: install_root_stats
+
+        - name: Select first existing install root
+          set_fact:
+            cached_install_root: >-
+              {{
+                (install_root_stats.results
+                  | selectattr('stat.exists','equalto',true)
+                  | map(attribute='install_root')
+                  | list
+                  | first) | default('')
+              }}
+
+        - name: Fail if no install root exists
+          assert:
+            that:
+              - cached_install_root | length > 0
+          fail_msg: "No WebSphere install root found on {{ inventory_hostname }}."
+
+        - name: Determine cached owner
+          stat:
+            path: "{{ cached_install_root }}"
+          register: cached_root_stat
+
+        - set_fact:
+            cached_install_owner: "{{ cached_root_stat.stat.pw_name | default('') }}"
+        - when: cached_install_owner | length == 0
+          block:
+            - shell: "ls -ld {{ cached_install_root }} | awk '{print $3}'"
+              register: cached_owner_cmd
+              changed_when: false
+            - set_fact:
+                cached_install_owner: "{{ cached_owner_cmd.stdout | trim }}"
+
+    - set_fact:
+        jvm_owner: "{{ cached_install_owner }}"
+        profile_dir: "{{ (cached_install_root | regex_replace('\\/$', '')) ~ '/profiles/' ~ profile_name }}"
+        profile_bin: "{{ (cached_install_root | regex_replace('\\/$', '')) ~ '/profiles/' ~ profile_name ~ '/bin' }}"
+        detected_cell_name: "unknown"
+
+    - name: Validate profile_dir exists
+      stat:
+        path: "{{ profile_dir }}"
+      register: profile_dir_stat
+    - assert:
+        that:
+          - profile_dir_stat.stat.exists
+      fail_msg: "Profile path not found: {{ profile_dir }}"
+
+- name: Debug - discovery outcome
+  when: wsjvm_debug | bool
+  debug:
+    msg:
+      host: "{{ inventory_hostname }}"
+      profile: "{{ profile_name }}"
+      discovery_source: "{{ discovery_source }}"
+      ps_found: "{{ ps_found_now }}"
+      jvm_owner: "{{ jvm_owner }}"
+      profile_bin: "{{ profile_bin }}"
+      cached_install_root: "{{ cached_install_root }}"
+      cached_install_owner: "{{ cached_install_owner }}"
+
+# ---- Banner (root-based; only if /home/<user>/.profile exists) ----
+- name: Set host banner once for this owner
+  when: (restart_banner_enabled | default(true)) | bool
+  include_tasks: banner_set_host.yml
+  vars:
+    banner_owner: "{{ jvm_owner }}"
+    banner_summary: >-
+      WebSphere JVM restart IN PROGRESS
+      RITM: {{ ritm_number }}
+      ENV: {{ env_name | default('na') }}
+      Host: {{ inventory_hostname }}
+      Profile: {{ profile_name }}
+      JVMs: {{ profile_jvms | join(', ') }}
+
+# ---- serverStatus PRE once ----
+- name: Run serverStatus.sh -all (pre)
+  shell: "{{ profile_bin }}/serverStatus.sh -all"
+  register: server_status_pre
+  become: true
+  become_user: "{{ jvm_owner }}"
+  changed_when: false
+  failed_when: false
+
+- name: Classify JVMs from pre serverStatus
+  set_fact:
+    jvms_started_pre: []
+    jvms_stopped_pre: []
+
+- name: Classify each JVM
+  set_fact:
+    jvms_started_pre: "{{ jvms_started_pre + ([one_jvm] if started_hit else []) }}"
+    jvms_stopped_pre: "{{ jvms_stopped_pre + ([one_jvm] if stopped_hit else []) }}"
+  vars:
+    started_hit: "{{ (server_status_pre.stdout | default('') | regex_search('ADMU0508I: The Application Server \"' ~ (one_jvm | regex_escape) ~ '\" is STARTED')) is not none }}"
+    stopped_hit: "{{ (server_status_pre.stdout | default('') | regex_search('ADMU0509I: The Application Server \"' ~ (one_jvm | regex_escape) ~ '\" cannot be reached')) is not none }}"
+  loop: "{{ profile_jvms }}"
+  loop_control:
+    loop_var: one_jvm
+    label: "{{ profile_name }} -> classify {{ one_jvm }}"
+
+- name: Ensure all JVMs classified
+  assert:
+    that:
+      - (jvms_started_pre | length) + (jvms_stopped_pre | length) == (profile_jvms | length)
+    fail_msg: "Some JVMs were not found/classified in serverStatus output for profile {{ profile_name }}."
+
+# ---- Start STOPPED JVMs (no ternary) ----
+- name: Start STOPPED JVMs
+  include_tasks: start_one_jvm.yml
+  loop: "{{ jvms_stopped_pre }}"
+  loop_control:
+    loop_var: stopped_jvm
+    label: "{{ profile_name }} -> start {{ stopped_jvm }}"
+
+# ---- Restart STARTED JVMs (no ternary; stop/start as become_user) ----
+- name: Restart STARTED JVMs safely
+  include_tasks: restart_started_jvm.yml
+  loop: "{{ jvms_started_pre }}"
+  loop_control:
+    loop_var: started_jvm
+    label: "{{ profile_name }} -> restart {{ started_jvm }}"
+  vars:
+    jvm_owner_for_restart: "{{ jvm_owner }}"
+    profile_bin_for_restart: "{{ profile_bin }}"
+    profile_name_for_restart: "{{ profile_name }}"
+
+# ---- serverStatus POST wait once for all JVMs ----
+- name: Wait until all JVMs STARTED (post)
+  shell: "{{ profile_bin }}/serverStatus.sh -all"
+  register: server_status_post
+  become: true
+  become_user: "{{ jvm_owner }}"
+  changed_when: false
+  failed_when: false
+  retries: "{{ restart_wait_retries }}"
+  delay: "{{ restart_wait_delay }}"
+  until: >-
+    {{
+      profile_jvms
+      | map('regex_escape')
+      | map('regex_replace', '^(.*)$', 'ADMU0508I: The Application Server \"\\1\" is STARTED')
+      | map('regex_search', server_status_post.stdout | default(''))
+      | select('!=', None)
+      | list
+      | length
+      == (profile_jvms | length)
+    }}
+
+# ---- Record results: include_tasks loop (no loop over block) ----
+- name: Record results for each JVM
+  include_tasks: record_one_jvm.yml
+  loop: "{{ profile_jvms }}"
+  loop_control:
+    loop_var: result_jvm
+    label: "{{ profile_name }} -> result {{ result_jvm }}"
+NEW: tasks/ps_discover_one.yml (NEW)
+---
+# Expects:
+#   discover_jvm, profile_name, ps_discover_lines_accum
+
+- name: PS discover DMGR (filtered by profile)
+  shell: "ps -ef | grep dmgr | grep {{ profile_name | quote }} | grep -v grep"
+  register: _ps_cmd
+  changed_when: false
+  failed_when: false
+  when: discover_jvm == 'dmgr'
+
+- name: PS discover NODEAGENT (filtered by profile)
+  shell: "ps -ef | grep nodeagent | grep {{ profile_name | quote }} | grep -v grep"
+  register: _ps_cmd
+  changed_when: false
+  failed_when: false
+  when: discover_jvm == 'nodeagent'
+
+- name: PS discover AppServer (java + jvm name)
+  shell: "ps -ef | grep java | grep {{ discover_jvm | quote }} | grep -v grep"
+  register: _ps_cmd
+  changed_when: false
+  failed_when: false
+  when: discover_jvm not in ['dmgr','nodeagent']
+
+- name: Append discovered lines to accumulator
+  set_fact:
+    ps_discover_lines_accum: "{{ ps_discover_lines_accum + (_ps_cmd.stdout_lines | default([])) }}"
+NEW: tasks/start_one_jvm.yml (NEW)
+---
+# Expects: stopped_jvm, profile_bin, jvm_owner
+
+- name: Start NODEAGENT
+  shell: "{{ profile_bin }}/startNode.sh"
+  become: true
+  become_user: "{{ jvm_owner }}"
+  changed_when: true
+  when: stopped_jvm == 'nodeagent'
+
+- name: Start DMGR
+  shell: "{{ profile_bin }}/startManager.sh"
+  become: true
+  become_user: "{{ jvm_owner }}"
+  changed_when: true
+  when: stopped_jvm == 'dmgr'
+
+- name: Start AppServer
+  shell: "{{ profile_bin }}/startServer.sh {{ stopped_jvm }}"
+  become: true
+  become_user: "{{ jvm_owner }}"
+  changed_when: true
+  when: stopped_jvm not in ['dmgr','nodeagent']
+tasks/restart_started_jvm.yml (UPDATED)
+
+✅ 3 separate tasks for PID capture
+✅ 3 separate tasks for stop
+✅ 3 separate tasks for start
+✅ stop/start use become_user: jvm_owner_for_restart
+
+---
+- name: Initialize kill lookup vars
+  set_fact:
+    pid_to_kill: ""
+    _pid_lines: []
+
+- name: Capture PID for DMGR
+  shell: "ps -ef | grep dmgr | grep {{ profile_name_for_restart | quote }} | grep -v grep"
+  register: _ps_kill
+  changed_when: false
+  failed_when: false
+  when: started_jvm == 'dmgr'
+
+- name: Capture PID for NODEAGENT
+  shell: "ps -ef | grep nodeagent | grep {{ profile_name_for_restart | quote }} | grep -v grep"
+  register: _ps_kill
+  changed_when: false
+  failed_when: false
+  when: started_jvm == 'nodeagent'
+
+- name: Capture PID for AppServer
+  shell: "ps -ef | grep java | grep {{ started_jvm | quote }} | grep -v grep"
+  register: _ps_kill
+  changed_when: false
+  failed_when: false
+  when: started_jvm not in ['dmgr','nodeagent']
+
+- name: Extract pid_to_kill (first line)
+  set_fact:
+    _pid_lines: "{{ _ps_kill.stdout_lines | default([]) }}"
+    pid_to_kill: "{{ (_pid_lines | length > 0) | ternary((_pid_lines[0].split()[1]), '') }}"
+
+- name: Ensure PID is known
+  assert:
+    that:
+      - pid_to_kill | length > 0
+    fail_msg: "Cannot determine PID for {{ started_jvm }} in profile {{ profile_name_for_restart }}."
+
+- name: Stop NODEAGENT (async)
+  shell: "{{ profile_bin_for_restart }}/stopNode.sh"
+  become: true
+  become_user: "{{ jvm_owner_for_restart }}"
+  async: "{{ stop_timeout_seconds }}"
+  poll: 0
+  changed_when: true
+  when: started_jvm == 'nodeagent'
+
+- name: Stop DMGR (async)
+  shell: "{{ profile_bin_for_restart }}/stopManager.sh"
+  become: true
+  become_user: "{{ jvm_owner_for_restart }}"
+  async: "{{ stop_timeout_seconds }}"
+  poll: 0
+  changed_when: true
+  when: started_jvm == 'dmgr'
+
+- name: Stop AppServer (async)
+  shell: "{{ profile_bin_for_restart }}/stopServer.sh {{ started_jvm }}"
+  become: true
+  become_user: "{{ jvm_owner_for_restart }}"
+  async: "{{ stop_timeout_seconds }}"
+  poll: 0
+  changed_when: true
+  when: started_jvm not in ['dmgr','nodeagent']
+
+- name: Wait up to timeout for PID to disappear (ps polling)
+  block:
+    - name: Poll ps until PID disappears
+      shell: "ps -ef | awk '$2=={{ pid_to_kill }} {print}'"
+      register: pid_poll
+      become: true
+      become_user: "{{ jvm_owner_for_restart }}"
+      changed_when: false
+      failed_when: false
+      retries: "{{ (stop_timeout_seconds // stop_check_delay) | int }}"
+      delay: "{{ stop_check_delay }}"
+      until: (pid_poll.stdout | default('') | trim) == ""
+  rescue:
+    - name: Kill -9 PID if still present
+      shell: "kill -9 {{ pid_to_kill }}"
+      become: true
+      become_user: "{{ jvm_owner_for_restart }}"
+      changed_when: true
+      failed_when: false
+
+    - name: Poll until PID disappears after kill -9
+      shell: "ps -ef | awk '$2=={{ pid_to_kill }} {print}'"
+      register: pid_poll_after_kill
+      become: true
+      become_user: "{{ jvm_owner_for_restart }}"
+      changed_when: false
+      failed_when: false
+      retries: 60
+      delay: 5
+      until: (pid_poll_after_kill.stdout | default('') | trim) == ""
+
+- name: Final verify PID is gone before start
+  shell: "ps -ef | awk '$2=={{ pid_to_kill }} {print}'"
+  register: pid_final_check
+  become: true
+  become_user: "{{ jvm_owner_for_restart }}"
+  changed_when: false
+  failed_when: false
+
+- name: Assert PID is gone
+  assert:
+    that:
+      - (pid_final_check.stdout | default('') | trim) == ""
+    fail_msg: "PID {{ pid_to_kill }} still exists; will not start {{ started_jvm }}."
+
+- name: Start NODEAGENT
+  shell: "{{ profile_bin_for_restart }}/startNode.sh"
+  become: true
+  become_user: "{{ jvm_owner_for_restart }}"
+  changed_when: true
+  when: started_jvm == 'nodeagent'
+
+- name: Start DMGR
+  shell: "{{ profile_bin_for_restart }}/startManager.sh"
+  become: true
+  become_user: "{{ jvm_owner_for_restart }}"
+  changed_when: true
+  when: started_jvm == 'dmgr'
+
+- name: Start AppServer
+  shell: "{{ profile_bin_for_restart }}/startServer.sh {{ started_jvm }}"
+  become: true
+  become_user: "{{ jvm_owner_for_restart }}"
+  changed_when: true
+  when: started_jvm not in ['dmgr','nodeagent']
+tasks/record_one_jvm.yml (UPDATED – no ternary)
+---
+# Expects:
+# result_jvm, profile_name, server_status_post, jvms_started_pre, detected_cell_name, profile_dir, jvm_results
+
+- name: PS after for DMGR
+  shell: "ps -ef | grep dmgr | grep {{ profile_name | quote }} | grep -v grep"
+  register: _ps_after
+  changed_when: false
+  failed_when: false
+  when: result_jvm == 'dmgr'
+
+- name: PS after for NODEAGENT
+  shell: "ps -ef | grep nodeagent | grep {{ profile_name | quote }} | grep -v grep"
+  register: _ps_after
+  changed_when: false
+  failed_when: false
+  when: result_jvm == 'nodeagent'
+
+- name: PS after for AppServer
+  shell: "ps -ef | grep java | grep {{ result_jvm | quote }} | grep -v grep"
+  register: _ps_after
+  changed_when: false
+  failed_when: false
+  when: result_jvm not in ['dmgr','nodeagent']
+
+- name: Extract pid/cell and started_ok
+  set_fact:
+    ps_after_lines: "{{ _ps_after.stdout_lines | default([]) }}"
+    new_pid: "{{ (ps_after_lines | length > 0) | ternary((ps_after_lines[0].split()[1]), 'not found via ps') }}"
+    cell_name: "{{ (ps_after_lines | length > 0) | ternary((ps_after_lines[0].split()[-3]), (detected_cell_name | default('unknown'))) }}"
+    started_ok: "{{ (server_status_post.stdout | default('') | regex_search('ADMU0508I: The Application Server \"' ~ (result_jvm | regex_escape) ~ '\" is STARTED')) is not none }}"
+
+- name: Append per-JVM result
+  set_fact:
+    jvm_results: >-
+      {{
+        jvm_results + [
+          {
+            'env_name': (env_name | default('na')),
+            'env_host_profile_jvm': ((env_name | default('na')) ~ ':' ~ inventory_hostname ~ ':' ~ profile_name ~ ':' ~ result_jvm),
+            'status': ( 'success' if started_ok else 'failed' ),
+            'profile_dir': (profile_dir | default('unknown')),
+            'cell_name': (cell_name | default('unknown')),
+            'new_pid': (new_pid | default('')),
+            'action': ( 'restart' if (result_jvm in jvms_started_pre) else 'start' ),
+            'reason': ( '' if started_ok else 'Not STARTED after operations (post serverStatus)' )
+          }
+        ]
+      }}
+Banner YAMLs (UPDATED)
+tasks/banner_set_host.yml (UPDATED)
+
+✅ No getent
+✅ Only set banner if /home/<user>/.profile exists
+✅ Run as root (avoids AIX temp chmod errors)
+
+---
+- name: Check if banner owner .profile exists
+  stat:
+    path: "/home/{{ banner_owner }}/{{ restart_banner_profile_filename }}"
+  register: banner_profile_stat
+
+- name: Ensure .profile prints banner when status file exists
+  when: banner_profile_stat.stat.exists | default(false)
+  blockinfile:
+    path: "/home/{{ banner_owner }}/{{ restart_banner_profile_filename }}"
+    create: false
+    marker: "# {mark} {{ restart_banner_block_id }}"
+    block: |
+      if [ -f "$HOME/{{ restart_banner_status_filename }}" ]; then
+        echo "############################################################"
+        cat "$HOME/{{ restart_banner_status_filename }}"
+        echo "############################################################"
+      fi
+  become: true
+
+- name: Write banner status file (only if .profile exists)
+  when: banner_profile_stat.stat.exists | default(false)
+  copy:
+    dest: "/home/{{ banner_owner }}/{{ restart_banner_status_filename }}"
+    content: "{{ banner_summary }}\n"
+    owner: "{{ banner_owner }}"
+    mode: "0644"
+  become: true
+
+- name: Track owners touched (only if banner applied)
+  when: banner_profile_stat.stat.exists | default(false)
+  set_fact:
+    owners_touched: "{{ owners_touched | union([banner_owner]) }}"
+tasks/banner_cleanup.yml (UPDATED)
+---
+- name: Cleanup banner artifacts for all touched owners
+  loop: "{{ owners_touched | default([]) }}"
+  loop_control:
+    loop_var: banner_owner
+  block:
+    - name: Check if banner owner .profile exists
+      stat:
+        path: "/home/{{ banner_owner }}/{{ restart_banner_profile_filename }}"
+      register: cleanup_profile_stat
+
+    - name: Remove status file (best effort)
+      file:
+        path: "/home/{{ banner_owner }}/{{ restart_banner_status_filename }}"
+        state: absent
+      become: true
+      failed_when: false
+
+    - name: Remove managed .profile block (only if .profile exists)
+      when: cleanup_profile_stat.stat.exists | default(false)
+      blockinfile:
+        path: "/home/{{ banner_owner }}/{{ restart_banner_profile_filename }}"
+        marker: "# {mark} {{ restart_banner_block_id }}"
+        state: absent
+      become: true
+Aggregation YAMLs (unchanged)
+tasks/aggregate_and_notify.yml
+---
+- name: Load payload to get ritm_number
+  set_fact:
+    ws_payload: "{{ vars[role_payload_var_name] | default({}) }}"
+
+- name: Extract ritm_number
+  set_fact:
+    ritm_number: >-
+      {{
+        ws_payload.get('ritm_number')
+        or ws_payload.get('RITM number')
+        or ws_payload.get('ritmNumber')
+      }}
+
+- name: Find role dynamic groups
+  set_fact:
+    role_dyn_groups: >-
+      {{
+        (groups.keys() | list)
+        | select('match', '^' ~ (role_group_prefix | regex_escape) ~ '_')
+        | list
+      }}
+
+- name: Collect results from all hosts in role groups
+  set_fact:
+    all_jvm_results: "{{ (all_jvm_results | default([])) + (hostvars[target_host].jvm_results | default([])) }}"
+  loop: "{{ role_dyn_groups | map('extract', groups) | list | flatten }}"
+  loop_control:
+    loop_var: target_host
+    label: "{{ target_host }}"
+
+- name: Build failed_hosts list
+  set_fact:
+    failed_hosts: >-
+      {{
+        (all_jvm_results | default([])
+          | selectattr('status','equalto','failed')
+          | map(attribute='env_host_profile_jvm')
+          | list)
+      }}
+
+- name: Compute summary
+  set_fact:
+    overall_status: "{{ 'failed' if (failed_hosts | length > 0) else 'success' }}"
+    total_count: "{{ all_jvm_results | default([]) | length }}"
+    success_count: "{{ (all_jvm_results | default([]) | selectattr('status','equalto','success') | list | length) }}"
+    fail_count: "{{ failed_hosts | length }}"
+
+- name: Build ServiceNow body
+  set_fact:
+    snow_body_info:
+      status: "{{ overall_status }}"
+      ritm_number: "{{ ritm_number }}"
+      failed_hosts: "{{ failed_hosts }}"
+      message: >-
+        JVM restart summary for RITM {{ ritm_number }}.
+        Total: {{ total_count }}, Success: {{ success_count }}, Failed: {{ fail_count }}.
+
+- name: Send ServiceNow update
+  include_tasks: snow_update.yml
+tasks/snow_update.yml
+---
+- name: Validate ServiceNow endpoint settings
+  assert:
+    that:
+      - snow_instance_url | length > 0
+      - snow_update_path | length > 0
+    fail_msg: "snow_instance_url and snow_update_path must be set."
+
+- name: Build headers
+  set_fact:
+    snow_headers: >-
+      {{
+        {
+          'Accept': 'application/json',
+          'Content-Type': 'application/json'
+        }
+        | combine(
+            (snow_bearer_token | length > 0)
+            | ternary({'Authorization': 'Bearer ' ~ snow_bearer_token}, {})
+          )
+      }}
+
+- name: POST update to ServiceNow
+  uri:
+    url: "{{ snow_instance_url }}{{ snow_update_path }}"
+    method: POST
+    headers: "{{ snow_headers }}"
+    body_format: json
+    body: "{{ snow_body_info }}"
+    validate_certs: "{{ snow_validate_certs }}"
+    force_basic_auth: "{{ (snow_user | length > 0) and (snow_password | length > 0) }}"
+    user: "{{ snow_user | default(omit) }}"
+    password: "{{ snow_password | default(omit) }}"
+    status_code: [200, 201, 202, 204]
+  no_log: true
+How it works (quick explanation)
+Build phase (localhost)
+Reads jvm_restart.envs
+For each payload host, uses add_host to add it to:
+wsjvm_restart_targets (umbrella group)
+wsjvm_restart_targets_<env> (env group)
+Adds connection vars so AWX can SSH even if your inventory only has localhost:
+ansible_host, ansible_connection
+Execute phase (parallel per host)
+Runs only on wsjvm_restart_targets
+Batches by profile:
+serverStatus.sh -all once before
+start stopped JVMs (3 tasks)
+restart started JVMs (3 tasks stop + PID poll + 3 tasks start)
+serverStatus.sh -all once after (wait until all started)
+record results (include_tasks loop)
+Notify phase (localhost)
+Collects all jvm_results from target hosts
+Builds failed_hosts
+Posts one update to ServiceNow
+Important AWX settings (so this works with localhost-only inventory)
+Limit: empty
+Ask limit on launch: OFF
+Machine credential must allow SSH to the payload hosts
+
+If you want, I can also add a single variable like wsjvm_os_is_aix: true to auto-set safe defaults (pipelining/remote_tmp) and add extra debug around become failures.
