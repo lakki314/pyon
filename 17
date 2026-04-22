@@ -1,0 +1,333 @@
+---
+# roles/websphere_jvm_restart/tasks/restart_profile.yml
+#
+# Updated:
+# - Replaced the prior "until" logic with the recommended Ansible-2.9-safe pattern
+#   using select('search', server_status_post.stdout) to count STARTED matches.
+
+- name: Set profile vars for this batch
+  set_fact:
+    profile_name: "{{ profile_spec.key }}"
+    profile_jvms: "{{ profile_spec.value | default([]) }}"
+
+- name: Validate JVM list for profile
+  assert:
+    that:
+      - profile_jvms is sequence
+      - profile_jvms | length > 0
+    fail_msg: "No JVMs for profile {{ profile_name }} on {{ inventory_hostname }}."
+
+# ---- PS discovery (no ternary) ----
+- name: Initialize discovery vars
+  set_fact:
+    ps_discover_lines_accum: []
+    ps_discover_lines: []
+    ps_found_now: false
+    has_special: false
+    discovery_source: ""
+    detected_cell_name: "unknown"
+
+- name: PS discovery per JVM (dmgr/nodeagent/profile filter)
+  include_tasks: ps_discover_one.yml
+  loop: "{{ profile_jvms }}"
+  loop_control:
+    loop_var: discover_jvm
+    label: "{{ profile_name }} -> ps check {{ discover_jvm }}"
+
+- name: Normalize ps_discover_lines
+  set_fact:
+    ps_discover_lines: >-
+      {{
+        ps_discover_lines_accum
+        | select('string')
+        | map('trim')
+        | reject('equalto','')
+        | list
+      }}
+
+- name: Compute ps_found_now
+  set_fact:
+    ps_found_now: "{{ (ps_discover_lines | length) | int > 0 }}"
+
+- name: Determine if profile includes dmgr/nodeagent
+  set_fact:
+    has_special: "{{ (profile_jvms | intersect(['dmgr','nodeagent']) | length) > 0 }}"
+
+# ---- If ps found: owner from ps; path differs based on special ----
+- name: If ps found, derive owner and path
+  when: ps_found_now
+  block:
+    - name: Set jvm_owner from ps
+      set_fact:
+        ps_words: "{{ ps_discover_lines[0].split() }}"
+        jvm_owner: "{{ ps_words[0] }}"
+
+    - name: If special (dmgr/nodeagent), use cache for profile path
+      when: has_special
+      block:
+        - set_fact:
+            discovery_source: "ps(owner)+cache(path)"
+
+        - name: Populate cache only if empty
+          when: cached_install_root | length == 0
+          block:
+            - name: Check install roots
+              stat:
+                path: "{{ install_root }}"
+              loop: "{{ was_install_roots }}"
+              loop_control:
+                loop_var: install_root
+              register: install_root_stats
+
+            - name: Select first existing install root
+              set_fact:
+                cached_install_root: >-
+                  {{
+                    (install_root_stats.results
+                      | selectattr('stat.exists','equalto',true)
+                      | map(attribute='install_root')
+                      | list
+                      | first) | default('')
+                  }}
+
+            - name: Fail if no install root exists
+              assert:
+                that:
+                  - cached_install_root | length > 0
+                fail_msg: "No WebSphere install root found on {{ inventory_hostname }}."
+
+            - name: Determine cached owner
+              stat:
+                path: "{{ cached_install_root }}"
+              register: cached_root_stat
+
+            - set_fact:
+                cached_install_owner: "{{ cached_root_stat.stat.pw_name | default('') }}"
+            - when: cached_install_owner | length == 0
+              block:
+                - shell: "ls -ld {{ cached_install_root }} | awk '{print $3}'"
+                  register: cached_owner_cmd
+                  changed_when: false
+                - set_fact:
+                    cached_install_owner: "{{ cached_owner_cmd.stdout | trim }}"
+
+        - set_fact:
+            profile_dir: "{{ (cached_install_root | regex_replace('\\/$', '')) ~ '/profiles/' ~ profile_name }}"
+            profile_bin: "{{ (cached_install_root | regex_replace('\\/$', '')) ~ '/profiles/' ~ profile_name ~ '/bin' }}"
+            detected_cell_name: "unknown"
+
+        - name: Validate profile_dir exists
+          stat:
+            path: "{{ profile_dir }}"
+          register: profile_dir_stat
+        - assert:
+            that:
+              - profile_dir_stat.stat.exists
+            fail_msg: "Profile path not found: {{ profile_dir }}"
+
+    - name: If not special (AppServer), derive profile path from ps last-4-words rule
+      when: not has_special
+      block:
+        - set_fact:
+            discovery_source: "ps(owner+path)"
+            detected_config_path: "{{ ps_words[-4] }}"
+            detected_cell_name: "{{ ps_words[-3] }}"
+            detected_profile_name: "{{ ps_words[-2] }}"
+
+        - name: Validate ps-derived profile matches
+          assert:
+            that:
+              - detected_profile_name == profile_name
+            fail_msg: "ps-derived profile {{ detected_profile_name }} != payload profile {{ profile_name }}"
+
+        - set_fact:
+            profile_dir: "{{ detected_config_path | regex_replace('\\/config$', '') }}"
+            profile_bin: "{{ (detected_config_path | regex_replace('\\/config$', '')) ~ '/bin' }}"
+
+# ---- If ps NOT found: owner+path from cache ----
+- name: If no ps found, derive owner+path from cache
+  when: not ps_found_now
+  block:
+    - set_fact:
+        discovery_source: "cache(owner+path)"
+
+    - name: Populate cache only if empty
+      when: cached_install_root | length == 0
+      block:
+        - name: Check install roots
+          stat:
+            path: "{{ install_root }}"
+          loop: "{{ was_install_roots }}"
+          loop_control:
+            loop_var: install_root
+          register: install_root_stats
+
+        - name: Select first existing install root
+          set_fact:
+            cached_install_root: >-
+              {{
+                (install_root_stats.results
+                  | selectattr('stat.exists','equalto',true)
+                  | map(attribute='install_root')
+                  | list
+                  | first) | default('')
+              }}
+
+        - name: Fail if no install root exists
+          assert:
+            that:
+              - cached_install_root | length > 0
+            fail_msg: "No WebSphere install root found on {{ inventory_hostname }}."
+
+        - name: Determine cached owner
+          stat:
+            path: "{{ cached_install_root }}"
+          register: cached_root_stat
+
+        - set_fact:
+            cached_install_owner: "{{ cached_root_stat.stat.pw_name | default('') }}"
+        - when: cached_install_owner | length == 0
+          block:
+            - shell: "ls -ld {{ cached_install_root }} | awk '{print $3}'"
+              register: cached_owner_cmd
+              changed_when: false
+            - set_fact:
+                cached_install_owner: "{{ cached_owner_cmd.stdout | trim }}"
+
+    - set_fact:
+        jvm_owner: "{{ cached_install_owner }}"
+        profile_dir: "{{ (cached_install_root | regex_replace('\\/$', '')) ~ '/profiles/' ~ profile_name }}"
+        profile_bin: "{{ (cached_install_root | regex_replace('\\/$', '')) ~ '/profiles/' ~ profile_name ~ '/bin' }}"
+        detected_cell_name: "unknown"
+
+    - name: Validate profile_dir exists
+      stat:
+        path: "{{ profile_dir }}"
+      register: profile_dir_stat
+    - assert:
+        that:
+          - profile_dir_stat.stat.exists
+        fail_msg: "Profile path not found: {{ profile_dir }}"
+
+- name: Debug - discovery outcome
+  when: wsjvm_debug | bool
+  debug:
+    msg:
+      host: "{{ inventory_hostname }}"
+      profile: "{{ profile_name }}"
+      discovery_source: "{{ discovery_source }}"
+      ps_found: "{{ ps_found_now }}"
+      jvm_owner: "{{ jvm_owner }}"
+      profile_bin: "{{ profile_bin }}"
+      cached_install_root: "{{ cached_install_root }}"
+      cached_install_owner: "{{ cached_install_owner }}"
+
+# ---- Banner (root-based; only if /home/<user>/.profile exists) ----
+- name: Set host banner once for this owner
+  when: (restart_banner_enabled | default(true)) | bool
+  include_tasks: banner_set_host.yml
+  vars:
+    banner_owner: "{{ jvm_owner }}"
+    banner_summary: >-
+      WebSphere JVM restart IN PROGRESS
+      RITM: {{ ritm_number }}
+      ENV: {{ env_name | default('na') }}
+      Host: {{ inventory_hostname }}
+      Profile: {{ profile_name }}
+      JVMs: {{ profile_jvms | join(', ') }}
+
+# ---- serverStatus PRE once ----
+- name: Run serverStatus.sh -all (pre)
+  shell: "{{ profile_bin }}/serverStatus.sh -all"
+  register: server_status_pre
+  become: true
+  become_user: "{{ jvm_owner }}"
+  changed_when: false
+  failed_when: false
+
+- name: Classify JVMs from pre serverStatus
+  set_fact:
+    jvms_started_pre: []
+    jvms_stopped_pre: []
+
+- name: Classify each JVM
+  set_fact:
+    jvms_started_pre: "{{ jvms_started_pre + ([one_jvm] if started_hit else []) }}"
+    jvms_stopped_pre: "{{ jvms_stopped_pre + ([one_jvm] if stopped_hit else []) }}"
+  vars:
+    started_hit: "{{ (server_status_pre.stdout | default('') | regex_search('ADMU0508I: The Application Server \"' ~ (one_jvm | regex_escape) ~ '\" is STARTED')) is not none }}"
+    stopped_hit: "{{ (server_status_pre.stdout | default('') | regex_search('ADMU0509I: The Application Server \"' ~ (one_jvm | regex_escape) ~ '\" cannot be reached')) is not none }}"
+  loop: "{{ profile_jvms }}"
+  loop_control:
+    loop_var: one_jvm
+    label: "{{ profile_name }} -> classify {{ one_jvm }}"
+
+- name: Ensure all JVMs classified
+  assert:
+    that:
+      - (jvms_started_pre | length) + (jvms_stopped_pre | length) == (profile_jvms | length)
+    fail_msg: "Some JVMs were not found/classified in serverStatus output for profile {{ profile_name }}."
+
+# ---- Start STOPPED JVMs (no ternary) ----
+- name: Start STOPPED JVMs
+  include_tasks: start_one_jvm.yml
+  loop: "{{ jvms_stopped_pre }}"
+  loop_control:
+    loop_var: stopped_jvm
+    label: "{{ profile_name }} -> start {{ stopped_jvm }}"
+
+# ---- Restart STARTED JVMs ----
+- name: Restart STARTED JVMs safely
+  include_tasks: restart_started_jvm.yml
+  loop: "{{ jvms_started_pre }}"
+  loop_control:
+    loop_var: started_jvm
+    label: "{{ profile_name }} -> restart {{ started_jvm }}"
+  vars:
+    jvm_owner_for_restart: "{{ jvm_owner }}"
+    profile_bin_for_restart: "{{ profile_bin }}"
+    profile_name_for_restart: "{{ profile_name }}"
+
+# ---- Wait until all JVMs STARTED (post) - RECOMMENDED PATTERN ----
+# Uses select('search', server_status_post.stdout) to count matches safely in Ansible 2.9.
+- name: Wait until all JVMs are STARTED (post) - count based (Ansible 2.9 safe)
+  shell: "{{ profile_bin }}/serverStatus.sh -all"
+  register: server_status_post
+  become: true
+  become_user: "{{ jvm_owner }}"
+  changed_when: false
+  failed_when: false
+  retries: "{{ restart_wait_retries }}"
+  delay: "{{ restart_wait_delay }}"
+  until: >-
+    {{
+      (
+        profile_jvms
+        | map('regex_escape')
+        | map('regex_replace', '^(.*)$', 'ADMU0508I: The Application Server \"\\1\" is STARTED')
+        | list
+        | select('search', server_status_post.stdout | default(''))
+        | list
+        | length
+      ) == (profile_jvms | length)
+    }}
+
+- name: Debug - JVMs not yet STARTED (post)
+  when: wsjvm_debug | bool
+  debug:
+    msg:
+      profile: "{{ profile_name }}"
+      not_started: >-
+        {{
+          profile_jvms
+          | reject('search', server_status_post.stdout | default(''))
+          | list
+        }}
+
+# ---- Record results: include_tasks loop ----
+- name: Record results for each JVM
+  include_tasks: record_one_jvm.yml
+  loop: "{{ profile_jvms }}"
+  loop_control:
+    loop_var: result_jvm
+    label: "{{ profile_name }} -> result {{ result_jvm }}"
