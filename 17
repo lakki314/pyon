@@ -1,3 +1,27 @@
+- name: Wait until all JVMs are STARTED (post) - parse started names (robust)
+  shell: >-
+    {{ profile_bin }}/serverStatus.sh -all |
+    awk '
+      /ADMU0508I: The Application Server/ {
+        # Extract the server name between quotes
+        match($0, /"[^"]+"/);
+        s = substr($0, RSTART+1, RLENGTH-2);
+        print s
+      }
+    '
+  register: started_servers_post
+  become: true
+  become_user: "{{ jvm_owner }}"
+  changed_when: false
+  failed_when: false
+  retries: "{{ restart_wait_retries }}"
+  delay: "{{ restart_wait_delay }}"
+  until: >-
+    {{
+      (profile_jvms
+        | difference((started_servers_post.stdout_lines | default([])) | map('trim') | list)
+        | length) == 0
+    }}
 ---
 # roles/websphere_jvm_restart/tasks/restart_profile.yml
 #
