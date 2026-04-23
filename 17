@@ -2,10 +2,20 @@
     - >-
       (
         profile_jvms
-        | map('regex_replace', '^(.*)$', 'ADMU0508I: The Application Server \"\\1\" is STARTED')
+        | map('trim')
+        | unique
+        | map('regex_escape')
+        | map('regex_replace', '^(.*)$', 'ADMU0508I:\\s*The Application Server\\s*\"\\1\"\\s*is\\s*STARTED')
         | list
       )
-      | difference((server_status_post.stdout_lines | default([])) | map('trim') | list)
+      | difference(
+          (server_status_post.stdout_lines | default([]))
+          | map('regex_replace', '\r', '')
+          | map('trim')
+          | list
+          | join('\n')
+          | list
+        )
       | length
       == 0
 
