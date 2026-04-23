@@ -1,0 +1,181 @@
+I’m outputting the full contents of the updated files.
+
+1) roles/websphere_jvm_restart/tasks/record_one_jvm.yml (UPDATED)
+What changed
+started_ok now checks the correct STARTED line depending on JVM type:
+nodeagent → Node Agent
+dmgr → Deployment Manager
+otherwise → Application Server
+---
+# Expects from restart_profile.yml context:
+# - result_jvm, profile_name
+# - server_status_post (stdout / stdout_lines)
+# - jvms_started_pre
+# - detected_cell_name
+# - profile_dir
+# - jvm_results, env_name
+
+# ---- PS after (no ternary) ----
+- name: PS after for DMGR
+  shell: "ps -ef | grep dmgr | grep {{ profile_name | quote }} | grep -v grep"
+  register: _ps_after
+  changed_when: false
+  failed_when: false
+  when: result_jvm == 'dmgr'
+
+- name: PS after for NODEAGENT
+  shell: "ps -ef | grep nodeagent | grep {{ profile_name | quote }} | grep -v grep"
+  register: _ps_after
+  changed_when: false
+  failed_when: false
+  when: result_jvm == 'nodeagent'
+
+- name: PS after for AppServer
+  shell: "ps -ef | grep java | grep {{ result_jvm | quote }} | grep -v grep"
+  register: _ps_after
+  changed_when: false
+  failed_when: false
+  when: result_jvm not in ['dmgr','nodeagent']
+
+# ---- Normalize post serverStatus lines (for exact membership checks) ----
+- name: Normalize serverStatus post lines
+  set_fact:
+    _post_lines_norm: >-
+      {{
+        (server_status_post.stdout_lines | default([]))
+        | map('regex_replace', '\r', '')
+        | map('regex_replace', '[ \t]+', ' ')
+        | map('trim')
+        | list
+      }}
+  changed_when: false
+
+# ---- Build expected STARTED line for this JVM ----
+- name: Build expected STARTED line for this JVM
+  set_fact:
+    _expected_started_line: >-
+      {{
+        (
+          'ADMU0508I: The Node Agent "nodeagent" is STARTED'
+          if result_jvm == 'nodeagent'
+          else
+          (
+            'ADMU0508I: The Deployment Manager "dmgr" is STARTED'
+            if result_jvm == 'dmgr'
+            else
+            ('ADMU0508I: The Application Server "' ~ (result_jvm | trim) ~ '" is STARTED')
+          )
+        )
+      }}
+  changed_when: false
+
+# ---- Extract pid/cell and started_ok ----
+- name: Extract pid/cell and started_ok
+  set_fact:
+    ps_after_lines: "{{ _ps_after.stdout_lines | default([]) }}"
+    new_pid: "{{ (ps_after_lines | length > 0) | ternary((ps_after_lines[0].split()[1]), 'not found via ps') }}"
+    cell_name: "{{ (ps_after_lines | length > 0) | ternary((ps_after_lines[0].split()[-3]), (detected_cell_name | default('unknown'))) }}"
+    started_ok: "{{ _expected_started_line in _post_lines_norm }}"
+  changed_when: false
+
+# ---- Append result ----
+- name: Append per-JVM result
+  set_fact:
+    jvm_results: >-
+      {{
+        jvm_results + [
+          {
+            'env_name': (env_name | default('na')),
+            'env_host_profile_jvm': ((env_name | default('na')) ~ ':' ~ inventory_hostname ~ ':' ~ profile_name ~ ':' ~ result_jvm),
+            'status': ( 'success' if started_ok else 'failed' ),
+            'profile_dir': (profile_dir | default('unknown')),
+            'cell_name': (cell_name | default('unknown')),
+            'new_pid': (new_pid | default('')),
+            'action': ( 'restart' if (result_jvm in jvms_started_pre) else 'start' ),
+            'reason': ( '' if started_ok else ('Not STARTED after operations (missing: ' ~ _expected_started_line ~ ')') )
+          }
+        ]
+      }}
+2) roles/websphere_jvm_restart/tasks/restart_profile.yml (UPDATED snippets you must replace)
+
+You asked to “output updated yamls” — the entire file is large, but the only parts that change for this request are:
+
+✅ PRE classification started_hit logic
+✅ expected_started_lines builder logic
+✅ post wait uses expected_started_lines (already in your file)
+
+Below are the full updated sections to paste into your existing restart_profile.yml.
+
+2.1 PRE classification (UPDATED)
+
+Replace your existing “Classify each JVM” task with this:
+
+- name: Classify each JVM (AppServer vs nodeagent vs dmgr)
+  set_fact:
+    jvms_started_pre: "{{ jvms_started_pre + ([one_jvm] if started_hit else []) }}"
+    jvms_stopped_pre: "{{ jvms_stopped_pre + ([one_jvm] if stopped_hit else []) }}"
+  vars:
+    started_hit: >-
+      {{
+        (
+          (one_jvm == 'nodeagent' and (server_status_pre.stdout | default('') | regex_search('ADMU0508I: The Node Agent \"nodeagent\" is STARTED')) is not none)
+          or
+          (one_jvm == 'dmgr' and (server_status_pre.stdout | default('') | regex_search('ADMU0508I: The Deployment Manager \"dmgr\" is STARTED')) is not none)
+          or
+          (one_jvm not in ['dmgr','nodeagent'] and (server_status_pre.stdout | default('') | regex_search('ADMU0508I: The Application Server \"' ~ (one_jvm | regex_escape) ~ '\" is STARTED')) is not none)
+        )
+      }}
+    # Keeping your existing STOPPED detection. If dmgr/nodeagent have different STOPPED lines in your env, tell me.
+    stopped_hit: "{{ (server_status_pre.stdout | default('') | regex_search('ADMU0509I: The Application Server \"' ~ (one_jvm | regex_escape) ~ '\" cannot be reached')) is not none }}"
+  loop: "{{ profile_jvms }}"
+  loop_control:
+    loop_var: one_jvm
+    label: "{{ profile_name }} -> classify {{ one_jvm }}"
+2.2 Build expected_started_lines (UPDATED – special lines)
+
+Replace your existing “expected_started_lines” builder with this (no regex \1 issues):
+
+- name: Reset expected_started_lines
+  set_fact:
+    expected_started_lines: []
+  changed_when: false
+
+- name: Add expected STARTED line for NODEAGENT
+  set_fact:
+    expected_started_lines: "{{ expected_started_lines + [ 'ADMU0508I: The Node Agent \"nodeagent\" is STARTED' ] }}"
+  changed_when: false
+  when: item == 'nodeagent'
+  loop: "{{ profile_jvms | map('trim') | unique | list }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: Add expected STARTED line for DMGR
+  set_fact:
+    expected_started_lines: "{{ expected_started_lines + [ 'ADMU0508I: The Deployment Manager \"dmgr\" is STARTED' ] }}"
+  changed_when: false
+  when: item == 'dmgr'
+  loop: "{{ profile_jvms | map('trim') | unique | list }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: Add expected STARTED line for Application Server
+  set_fact:
+    expected_started_lines: "{{ expected_started_lines + [ 'ADMU0508I: The Application Server \"' ~ (item | trim) ~ '\" is STARTED' ] }}"
+  changed_when: false
+  when: item not in ['dmgr','nodeagent']
+  loop: "{{ profile_jvms | map('trim') | unique | list }}"
+  loop_control:
+    label: "{{ item }}"
+2.3 Ensure you are calling the updated record_one_jvm.yml
+
+Your bottom section should already be:
+
+- name: Record results for each JVM
+  include_tasks: record_one_jvm.yml
+  loop: "{{ profile_jvms }}"
+  loop_control:
+    loop_var: result_jvm
+
+No change needed there (it will now use the updated record file).
+
+If you want, I can paste the entire restart_profile.yml with these changes already merged in the correct positions, but the two blocks above are the only edits needed for this request plus the fully updated record_one_jvm.yml.
