@@ -1,3 +1,110 @@
+1) Update restart_profile.yml to pass structured lines (same as before)
+- name: Set host banner once for this owner
+  when: (restart_banner_enabled | default(true)) | bool
+  include_tasks: banner_set_host.yml
+  vars:
+    banner_owner: "{{ jvm_owner }}"
+    banner_lines:
+      - "RITM: {{ ritm_number }}"
+      - "Timestamp: {{ lookup('pipe', 'date \"+%Y-%m-%d %H:%M:%S %Z\"') }}"
+      - "Contact/Team: {{ wsjvm_contact_team | default('Middleware Operations') }}"
+      - "Change Window: {{ wsjvm_change_window | default('As per approved change window') }}"
+      - "Environment: {{ env_name | default('na') }}"
+      - "Host: {{ inventory_hostname }}"
+      - "Profile: {{ profile_name }}"
+      - "JVMs: {{ profile_jvms | join(', ') }}"
+2) Update banner_set_host.yml to write multi-line AND print nicely
+roles/websphere_jvm_restart/tasks/banner_set_host.yml (UPDATED)
+---
+- name: Check if banner owner .profile exists
+  stat:
+    path: "/home/{{ banner_owner }}/{{ restart_banner_profile_filename }}"
+  register: banner_profile_stat
+
+- name: Ensure .profile prints banner when status file exists (RED + official + aligned)
+  when: banner_profile_stat.stat.exists | default(false)
+  blockinfile:
+    path: "/home/{{ banner_owner }}/{{ restart_banner_profile_filename }}"
+    create: false
+    marker: "# {mark} {{ restart_banner_block_id }}"
+    block: |
+      if [ -f "$HOME/{{ restart_banner_status_filename }}" ]; then
+        RED="$(printf '\033[1;31m')"
+        BOLD="$(printf '\033[1m')"
+        RESET="$(printf '\033[0m')"
+
+        echo "${RED}######################################################################${RESET}"
+        echo "${RED}#${BOLD}                   OFFICIAL AUTOMATION NOTICE                        ${RESET}${RED}#${RESET}"
+        echo "${RED}#${RESET}  WebSphere JVM restart is currently IN PROGRESS on this host.       ${RED}#${RESET}"
+        echo "${RED}#${RESET}  Do not manually stop/start JVMs unless authorized by the change.   ${RED}#${RESET}"
+        echo "${RED}######################################################################${RESET}"
+        echo
+
+        # Pretty-print the status file as aligned KEY : VALUE
+        # - Lines formatted as "Key: Value"
+        # - Continuation lines (no ":") are indented
+        awk -v RED="${RED}" -v RESET="${RESET}" '
+          BEGIN { pad=16 }
+          {
+            line=$0
+            sub(/\r$/, "", line)
+            if (match(line, /^[^:]+:[[:space:]]*/)) {
+              key = substr(line, 1, index(line, ":")-1)
+              val = substr(line, index(line, ":")+1)
+              sub(/^[[:space:]]+/, "", val)
+
+              # trim key spaces
+              gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+
+              # print aligned
+              printf("%s%-*s%s : %s\n", RED, pad, key, RESET, val)
+            } else if (length(line) > 0) {
+              # continuation line
+              printf("%s%-*s%s   %s\n", RED, pad, "", RESET, line)
+            } else {
+              print ""
+            }
+          }
+        ' "$HOME/{{ restart_banner_status_filename }}"
+
+        echo
+        echo "${RED}######################################################################${RESET}"
+      fi
+  become: true
+
+- name: Write banner status file (only if .profile exists)
+  when: banner_profile_stat.stat.exists | default(false)
+  copy:
+    dest: "/home/{{ banner_owner }}/{{ restart_banner_status_filename }}"
+    content: "{{ (banner_lines | default([banner_summary | default('')])) | join('\n') }}\n"
+    owner: "{{ banner_owner }}"
+    mode: "0644"
+  become: true
+
+- name: Track owners touched (only if banner applied)
+  when: banner_profile_stat.stat.exists | default(false)
+  set_fact:
+    owners_touched: "{{ owners_touched | union([banner_owner]) }}"
+What the login banner will look like
+######################################################################
+#                   OFFICIAL AUTOMATION NOTICE                        #
+#  WebSphere JVM restart is currently IN PROGRESS on this host.       #
+#  Do not manually stop/start JVMs unless authorized by the change.   #
+######################################################################
+
+RITM             : RITM1234
+Timestamp        : 2026-04-22 19:22:10 EDT
+Contact/Team     : Middleware Operations
+Change Window    : 2026-04-22 19:00–21:00 EDT
+Environment      : dev
+Host             : test1
+Profile          : AppSrv01
+JVMs             : server1, nodeagent, dmgr
+
+######################################################################
+
+
+
 roles/websphere_jvm_restart/defaults/main.yml (UPDATED)
 ---
 role_payload_var_name: "jvm_restart"
