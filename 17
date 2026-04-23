@@ -1,3 +1,109 @@
+roles/websphere_jvm_restart/defaults/main.yml (UPDATED)
+---
+role_payload_var_name: "jvm_restart"
+role_group_prefix: "wsjvm_restart_targets"
+
+wsjvm_debug: false
+
+restart_wait_retries: 30
+restart_wait_delay: 10
+
+stop_timeout_seconds: 600
+stop_check_delay: 15
+
+was_install_roots:
+  - "/opt/wps8/websphere/AppServer/85/"
+  - "/opt/websphere/85/commonprofile/AppServer"
+  - "/opt/websphere/90/commonprofile/AppServer"
+  - "/opt/websphere/85/AppServer/"
+
+restart_banner_enabled: true
+restart_banner_status_filename: ".was_jvm_restart_status"
+restart_banner_profile_filename: ".profile"
+restart_banner_block_id: "ANSIBLE MANAGED - WAS JVM RESTART BANNER"
+
+# Banner metadata (can be overridden at launch)
+wsjvm_contact_team: "Middleware Operations"
+wsjvm_change_window: "As per approved change window"
+
+snow_instance_url: ""
+snow_update_path: ""
+snow_validate_certs: true
+snow_user: ""
+snow_password: ""
+snow_bearer_token: ""
+roles/websphere_jvm_restart/tasks/banner_set_host.yml (UPDATED — red + official + embeds status file)
+---
+- name: Check if banner owner .profile exists
+  stat:
+    path: "/home/{{ banner_owner }}/{{ restart_banner_profile_filename }}"
+  register: banner_profile_stat
+
+- name: Ensure .profile prints banner when status file exists (RED + official)
+  when: banner_profile_stat.stat.exists | default(false)
+  blockinfile:
+    path: "/home/{{ banner_owner }}/{{ restart_banner_profile_filename }}"
+    create: false
+    marker: "# {mark} {{ restart_banner_block_id }}"
+    block: |
+      if [ -f "$HOME/{{ restart_banner_status_filename }}" ]; then
+        # ---- Official Automation Banner (RED) ----
+        RED="$(printf '\033[1;31m')"
+        BOLD="$(printf '\033[1m')"
+        RESET="$(printf '\033[0m')"
+
+        echo "${RED}######################################################################${RESET}"
+        echo "${RED}#${BOLD}                   OFFICIAL AUTOMATION NOTICE                        ${RESET}${RED}#${RESET}"
+        echo "${RED}#${RESET}  A WebSphere JVM restart is currently IN PROGRESS on this host.     ${RED}#${RESET}"
+        echo "${RED}#${RESET}  Do not manually stop/start JVMs unless authorized by the change.   ${RED}#${RESET}"
+        echo "${RED}######################################################################${RESET}"
+        echo "${RED}#${RESET}"
+        # Print the detailed status message (written by automation)
+        sed 's/^/'"${RED}"'> '"${RESET}"'/' "$HOME/{{ restart_banner_status_filename }}"
+        echo "${RED}#${RESET}"
+        echo "${RED}######################################################################${RESET}"
+      fi
+  become: true
+
+- name: Write banner status file (only if .profile exists)
+  when: banner_profile_stat.stat.exists | default(false)
+  copy:
+    dest: "/home/{{ banner_owner }}/{{ restart_banner_status_filename }}"
+    content: "{{ banner_summary }}\n"
+    owner: "{{ banner_owner }}"
+    mode: "0644"
+  become: true
+
+- name: Track owners touched (only if banner applied)
+  when: banner_profile_stat.stat.exists | default(false)
+  set_fact:
+    owners_touched: "{{ owners_touched | union([banner_owner]) }}"
+roles/websphere_jvm_restart/tasks/restart_profile.yml (UPDATED — banner_summary now embeds RITM/timestamp/team/window)
+
+Only the banner call section is updated below (drop-in replacement for your existing banner task in restart_profile.yml):
+
+- name: Set host banner once for this owner
+  when: (restart_banner_enabled | default(true)) | bool
+  include_tasks: banner_set_host.yml
+  vars:
+    banner_owner: "{{ jvm_owner }}"
+    banner_summary: |-
+      RITM: {{ ritm_number }}
+      Timestamp: {{ lookup('pipe', 'date "+%Y-%m-%d %H:%M:%S %Z"') }}
+      Contact/Team: {{ wsjvm_contact_team | default('Middleware Operations') }}
+      Change Window: {{ wsjvm_change_window | default('As per approved change window') }}
+      Environment: {{ env_name | default('na') }}
+      Host: {{ inventory_hostname }}
+      Profile: {{ profile_name }}
+      JVMs: {{ profile_jvms | join(', ') }}
+Example override at launch (AWX extra_vars)
+wsjvm_contact_team: "WAS Platform Team"
+wsjvm_change_window: "2026-04-22 19:00–21:00 EDT"
+
+
+
+
+
 - name: Build expected STARTED lines (once per profile) - concat
   set_fact:
     expected_started_lines: "{{ expected_started_lines | default([]) + [ 'ADMU0508I: The Application Server \"' ~ item | trim ~ '\" is STARTED' ] }}"
