@@ -1,3 +1,11 @@
+- name: Build expected STARTED lines (once per profile) - concat
+  set_fact:
+    expected_started_lines: "{{ expected_started_lines | default([]) + [ 'ADMU0508I: The Application Server \"' ~ item | trim ~ '\" is STARTED' ] }}"
+  loop: "{{ profile_jvms | map('trim') | unique | list }}"
+  loop_control:
+    label: "{{ item }}"
+  changed_when: false
+
 until:
     - >-
       (
