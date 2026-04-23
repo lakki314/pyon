@@ -1,22 +1,21 @@
- until:
+until:
     - >-
       (
         profile_jvms
         | map('trim')
         | unique
-        | map('regex_escape')
-        | map('regex_replace', '^(.*)$', 'ADMU0508I:\\s*The Application Server\\s*\"\\1\"\\s*is\\s*STARTED')
+        | map('regex_replace', '^(.*)$', 'ADMU0508I: The Application Server \"\\1\" is STARTED')
         | list
       )
       | difference(
           (server_status_post.stdout_lines | default([]))
           | map('regex_replace', '\r', '')
+          | map('regex_replace', '[ \t]+', ' ')
           | map('trim')
-          | list
-          | join('\n')
           | list
         )
       | length
+      == 0
       == 0
 
 Use this until task (note: no regex_escape needed for this, since we’re not using regex; we want an exact string):
