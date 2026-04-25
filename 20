@@ -11,3 +11,24 @@
           | list
         }}
       expected_dmgr: 'ADMU0508I: The Deployment Manager "dmgr" is STARTED'
+- name: Wait for DMGR STARTED line (post)
+  shell: "{{ profile_bin }}/serverStatus.sh -all"
+  register: server_status_post
+  become: true
+  become_user: "{{ jvm_owner }}"
+  changed_when: false
+  failed_when: false
+  retries: "{{ restart_wait_retries_dmgr | default(restart_wait_retries) }}"
+  delay: "{{ restart_wait_delay_dmgr | default(restart_wait_delay) }}"
+  vars:
+    normalized_lines_post: >-
+      {{
+        (server_status_post.stdout_lines | default([]))
+        | map('regex_replace', '\r', '')
+        | map('regex_replace', '[ \t]+', ' ')
+        | map('trim')
+        | list
+      }}
+    dmgr_line: 'ADMU0508I: The Deployment Manager "dmgr" is STARTED'
+  until: dmgr_line in normalized_lines_post
+  when: "'dmgr' in (profile_jvms | map('trim') | list)"
