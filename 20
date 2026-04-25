@@ -1,0 +1,13 @@
+- name: Debug - find dmgr STARTED lines in serverStatus output
+  when: wsjvm_debug | bool
+  debug:
+    msg:
+      dmgr_lines: >-
+        {{
+          (server_status_post.stdout_lines | default([]))
+          | map('regex_replace','\r','')
+          | map('trim')
+          | select('search', 'dmgr')
+          | list
+        }}
+      expected_dmgr: 'ADMU0508I: The Deployment Manager "dmgr" is STARTED'
