@@ -1,27 +1,53 @@
-- name: Debug - find dmgr STARTED lines in serverStatus output
-  when: wsjvm_debug | bool
-  debug:
-    msg:
-      dmgr_lines: >-
-        {{
-          (server_status_post.stdout_lines | default([]))
-          | map('regex_replace','\r','')
-          | map('trim')
-          | select('search', 'dmgr')
-          | list
-        }}
-      expected_dmgr: 'ADMU0508I: The Deployment Manager "dmgr" is STARTED'
-- name: Wait for DMGR STARTED line (post)
+1) Build expected lines (same unified approach)
+roles/websphere_jvm_restart/tasks/build_expected_started_line_one.yml (NEW/USED)
+
+(If you already created this, keep it.)
+
+---
+- name: Add expected STARTED line for NODEAGENT
+  set_fact:
+    expected_started_lines: "{{ expected_started_lines + [ 'ADMU0508I: The Node Agent \"nodeagent\" is STARTED' ] }}"
+  changed_when: false
+  when: expected_jvm == 'nodeagent'
+
+- name: Add expected STARTED line for DMGR
+  set_fact:
+    expected_started_lines: "{{ expected_started_lines + [ 'ADMU0508I: The Deployment Manager \"dmgr\" is STARTED' ] }}"
+  changed_when: false
+  when: expected_jvm == 'dmgr'
+
+- name: Add expected STARTED line for Application Server
+  set_fact:
+    expected_started_lines: "{{ expected_started_lines + [ 'ADMU0508I: The Application Server \"' ~ expected_jvm ~ '\" is STARTED' ] }}"
+  changed_when: false
+  when: expected_jvm not in ['dmgr','nodeagent']
+2) Post-restart wait using “expected lines membership” (NO difference)
+
+Put this section in restart_profile.yml after start/restart actions and before recording results:
+
+- name: Reset expected_started_lines
+  set_fact:
+    expected_started_lines: []
+  changed_when: false
+
+- name: Build expected STARTED lines for all JVMs in this profile
+  include_tasks: build_expected_started_line_one.yml
+  loop: "{{ profile_jvms | map('trim') | unique | list }}"
+  loop_control:
+    loop_var: expected_jvm
+    label: "{{ expected_jvm }}"
+
+- name: Wait until all JVMs are STARTED (post) - expected lines membership (no difference)
   shell: "{{ profile_bin }}/serverStatus.sh -all"
   register: server_status_post
   become: true
   become_user: "{{ jvm_owner }}"
   changed_when: false
   failed_when: false
-  retries: "{{ restart_wait_retries_dmgr | default(restart_wait_retries) }}"
-  delay: "{{ restart_wait_delay_dmgr | default(restart_wait_delay) }}"
+  retries: "{{ restart_wait_retries }}"
+  delay: "{{ restart_wait_delay }}"
   vars:
-    normalized_lines_post: >-
+    normalized_lines: >-
       {{
         (server_status_post.stdout_lines | default([]))
         | map('regex_replace', '\r', '')
@@ -29,6 +55,28 @@
         | map('trim')
         | list
       }}
-    dmgr_line: 'ADMU0508I: The Deployment Manager "dmgr" is STARTED'
-  until: dmgr_line in normalized_lines_post
-  when: "'dmgr' in (profile_jvms | map('trim') | list)"
+    normalized_expected: >-
+      {{
+        expected_started_lines
+        | map('regex_replace', '\r', '')
+        | map('regex_replace', '[ \t]+', ' ')
+        | map('trim')
+        | list
+      }}
+    present_count: "{{ normalized_expected | select('in', normalized_lines) | list | length }}"
+    expected_count: "{{ normalized_expected | length }}"
+    missing_started_lines: "{{ normalized_expected | reject('in', normalized_lines) | list }}"
+  until: present_count == expected_count
+
+- name: Debug - missing STARTED lines (post)
+  when: wsjvm_debug | bool
+  debug:
+    msg:
+      profile: "{{ profile_name }}"
+      expected_count: "{{ expected_count }}"
+      present_count: "{{ present_count }}"
+      missing_started_lines: "{{ missing_started_lines }}"
+Why this is better
+No set math (difference)
+Very direct: “are all expected lines present?”
+You get missing_started_lines for easy troubleshooting.
