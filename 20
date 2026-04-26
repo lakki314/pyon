@@ -1,85 +1,9 @@
-- name: Classify each JVM (AppServer vs nodeagent vs dmgr) - STARTED + STOPPED
+# -----------------------------
+# Normalize serverStatus post lines
+# -----------------------------
+- name: Normalize serverStatus post lines
   set_fact:
-    jvms_started_pre: "{{ jvms_started_pre + ([one_jvm] if started_hit else []) }}"
-    jvms_stopped_pre: "{{ jvms_stopped_pre + ([one_jvm] if stopped_hit else []) }}"
-  vars:
-    started_hit: >-
-      {{
-        (
-          (one_jvm == 'nodeagent' and (server_status_pre.stdout | default('') | regex_search('ADMU0508I: The Node Agent \"nodeagent\" is STARTED')) is not none)
-          or
-          (one_jvm == 'dmgr' and (server_status_pre.stdout | default('') | regex_search('ADMU0508I: The Deployment Manager \"dmgr\" is STARTED')) is not none)
-          or
-          (one_jvm not in ['dmgr','nodeagent'] and (server_status_pre.stdout | default('') | regex_search('ADMU0508I: The Application Server \"' ~ (one_jvm | regex_escape) ~ '\" is STARTED')) is not none)
-        )
-      }}
-
-    stopped_hit: >-
-      {{
-        (
-          (one_jvm == 'nodeagent' and (server_status_pre.stdout | default('') | regex_search('ADMU0509I: The Node Agent \"nodeagent\" cannot be reached')) is not none)
-          or
-          (one_jvm == 'dmgr' and (server_status_pre.stdout | default('') | regex_search('ADMU0509I: The Deployment Manager \"dmgr\" cannot be reached')) is not none)
-          or
-          (one_jvm not in ['dmgr','nodeagent'] and (server_status_pre.stdout | default('') | regex_search('ADMU0509I: The Application Server \"' ~ (one_jvm | regex_escape) ~ '\" cannot be reached')) is not none)
-        )
-      }}
-  loop: "{{ profile_jvms }}"
-  loop_control:
-    loop_var: one_jvm
-    label: "{{ profile_name }} -> classify {{ one_jvm }}"
-
-
-1) Build expected lines (same unified approach)
-roles/websphere_jvm_restart/tasks/build_expected_started_line_one.yml (NEW/USED)
-
-(If you already created this, keep it.)
-
----
-- name: Add expected STARTED line for NODEAGENT
-  set_fact:
-    expected_started_lines: "{{ expected_started_lines + [ 'ADMU0508I: The Node Agent \"nodeagent\" is STARTED' ] }}"
-  changed_when: false
-  when: expected_jvm == 'nodeagent'
-
-- name: Add expected STARTED line for DMGR
-  set_fact:
-    expected_started_lines: "{{ expected_started_lines + [ 'ADMU0508I: The Deployment Manager \"dmgr\" is STARTED' ] }}"
-  changed_when: false
-  when: expected_jvm == 'dmgr'
-
-- name: Add expected STARTED line for Application Server
-  set_fact:
-    expected_started_lines: "{{ expected_started_lines + [ 'ADMU0508I: The Application Server \"' ~ expected_jvm ~ '\" is STARTED' ] }}"
-  changed_when: false
-  when: expected_jvm not in ['dmgr','nodeagent']
-2) Post-restart wait using “expected lines membership” (NO difference)
-
-Put this section in restart_profile.yml after start/restart actions and before recording results:
-
-- name: Reset expected_started_lines
-  set_fact:
-    expected_started_lines: []
-  changed_when: false
-
-- name: Build expected STARTED lines for all JVMs in this profile
-  include_tasks: build_expected_started_line_one.yml
-  loop: "{{ profile_jvms | map('trim') | unique | list }}"
-  loop_control:
-    loop_var: expected_jvm
-    label: "{{ expected_jvm }}"
-
-- name: Wait until all JVMs are STARTED (post) - expected lines membership (no difference)
-  shell: "{{ profile_bin }}/serverStatus.sh -all"
-  register: server_status_post
-  become: true
-  become_user: "{{ jvm_owner }}"
-  changed_when: false
-  failed_when: false
-  retries: "{{ restart_wait_retries }}"
-  delay: "{{ restart_wait_delay }}"
-  vars:
-    normalized_lines: >-
+    _post_lines_norm: >-
       {{
         (server_status_post.stdout_lines | default([]))
         | map('regex_replace', '\r', '')
@@ -87,28 +11,80 @@ Put this section in restart_profile.yml after start/restart actions and before r
         | map('trim')
         | list
       }}
-    normalized_expected: >-
-      {{
-        expected_started_lines
-        | map('regex_replace', '\r', '')
-        | map('regex_replace', '[ \t]+', ' ')
-        | map('trim')
-        | list
-      }}
-    present_count: "{{ normalized_expected | select('in', normalized_lines) | list | length }}"
-    expected_count: "{{ normalized_expected | length }}"
-    missing_started_lines: "{{ normalized_expected | reject('in', normalized_lines) | list }}"
-  until: present_count == expected_count
+  changed_when: false
 
-- name: Debug - missing STARTED lines (post)
+# -----------------------------
+# Build expected STARTED line for this JVM (ALL 3 TYPES)
+# -----------------------------
+- name: Init expected started line
+  set_fact:
+    _expected_started_line: ""
+  changed_when: false
+
+- name: Expected STARTED line for NODEAGENT
+  set_fact:
+    _expected_started_line: 'ADMU0508I: The Node Agent "nodeagent" is STARTED'
+  changed_when: false
+  when: (result_jvm | trim) == 'nodeagent'
+
+- name: Expected STARTED line for DMGR
+  set_fact:
+    _expected_started_line: 'ADMU0508I: The Deployment Manager "dmgr" is STARTED'
+  changed_when: false
+  when: (result_jvm | trim) == 'dmgr'
+
+- name: Expected STARTED line for Application Server
+  set_fact:
+    _expected_started_line: "ADMU0508I: The Application Server \"{{ result_jvm | trim }}\" is STARTED"
+  changed_when: false
+  when: (result_jvm | trim) not in ['dmgr','nodeagent']
+
+# -----------------------------
+# Extract pid/cell and started_ok
+# -----------------------------
+- name: Extract pid/cell and started_ok
+  set_fact:
+    ps_after_lines: "{{ _ps_after.stdout_lines | default([]) }}"
+    new_pid: "{{ (ps_after_lines | length > 0) | ternary((ps_after_lines[0].split()[1]), 'not found via ps') }}"
+    cell_name: "{{ (ps_after_lines | length > 0) | ternary((ps_after_lines[0].split()[-3]), (detected_cell_name | default('unknown'))) }}"
+    started_ok: "{{ (_expected_started_line | length > 0) and (_expected_started_line in _post_lines_norm) }}"
+  changed_when: false
+
+# Optional debug to prove the match (turn on wsjvm_debug)
+- name: Debug - started_ok evaluation
   when: wsjvm_debug | bool
   debug:
     msg:
-      profile: "{{ profile_name }}"
-      expected_count: "{{ expected_count }}"
-      present_count: "{{ present_count }}"
-      missing_started_lines: "{{ missing_started_lines }}"
-Why this is better
-No set math (difference)
-Very direct: “are all expected lines present?”
-You get missing_started_lines for easy troubleshooting.
+      jvm: "{{ result_jvm | trim }}"
+      expected_started_line: "{{ _expected_started_line }}"
+      started_ok: "{{ started_ok }}"
+      started_lines_in_output: "{{ _post_lines_norm | select('search', '^ADMU0508I:') | list }}"
+
+# -----------------------------
+# Append result
+# -----------------------------
+- name: Append per-JVM result
+  set_fact:
+    jvm_results: >-
+      {{
+        jvm_results + [
+          {
+            'env_name': (env_name | default('na')),
+            'env_host_profile_jvm': ((env_name | default('na')) ~ ':' ~ inventory_hostname ~ ':' ~ profile_name ~ ':' ~ (result_jvm | trim)),
+            'status': ( 'success' if started_ok else 'failed' ),
+            'profile_dir': (profile_dir | default('unknown')),
+            'cell_name': (cell_name | default('unknown')),
+            'new_pid': (new_pid | default('')),
+            'action': ( 'restart' if ((result_jvm | trim) in jvms_started_pre) else 'start' ),
+            'reason': ( '' if started_ok else ('Not STARTED after operations (missing: ' ~ _expected_started_line ~ ')') )
+          }
+        ]
+      }}
+Why this fixes your issue
+For nodeagent and dmgr, we now expect the correct serverStatus STARTED lines:
+Node Agent "nodeagent" is STARTED
+Deployment Manager "dmgr" is STARTED
+We use real quotes in the expected string (not \\\" or templated \1)
+We normalize output lines before membership checks, so trailing spaces/CR won’t break it.
+
+If you also want the pre-classification (started_hit / stopped_hit) to use the same expected-line builder approach (single source of truth), I can refactor that too so you don’t maintain logic twice.
