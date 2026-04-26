@@ -1,3 +1,35 @@
+- name: Classify each JVM (AppServer vs nodeagent vs dmgr) - STARTED + STOPPED
+  set_fact:
+    jvms_started_pre: "{{ jvms_started_pre + ([one_jvm] if started_hit else []) }}"
+    jvms_stopped_pre: "{{ jvms_stopped_pre + ([one_jvm] if stopped_hit else []) }}"
+  vars:
+    started_hit: >-
+      {{
+        (
+          (one_jvm == 'nodeagent' and (server_status_pre.stdout | default('') | regex_search('ADMU0508I: The Node Agent \"nodeagent\" is STARTED')) is not none)
+          or
+          (one_jvm == 'dmgr' and (server_status_pre.stdout | default('') | regex_search('ADMU0508I: The Deployment Manager \"dmgr\" is STARTED')) is not none)
+          or
+          (one_jvm not in ['dmgr','nodeagent'] and (server_status_pre.stdout | default('') | regex_search('ADMU0508I: The Application Server \"' ~ (one_jvm | regex_escape) ~ '\" is STARTED')) is not none)
+        )
+      }}
+
+    stopped_hit: >-
+      {{
+        (
+          (one_jvm == 'nodeagent' and (server_status_pre.stdout | default('') | regex_search('ADMU0509I: The Node Agent \"nodeagent\" cannot be reached')) is not none)
+          or
+          (one_jvm == 'dmgr' and (server_status_pre.stdout | default('') | regex_search('ADMU0509I: The Deployment Manager \"dmgr\" cannot be reached')) is not none)
+          or
+          (one_jvm not in ['dmgr','nodeagent'] and (server_status_pre.stdout | default('') | regex_search('ADMU0509I: The Application Server \"' ~ (one_jvm | regex_escape) ~ '\" cannot be reached')) is not none)
+        )
+      }}
+  loop: "{{ profile_jvms }}"
+  loop_control:
+    loop_var: one_jvm
+    label: "{{ profile_name }} -> classify {{ one_jvm }}"
+
+
 1) Build expected lines (same unified approach)
 roles/websphere_jvm_restart/tasks/build_expected_started_line_one.yml (NEW/USED)
 
