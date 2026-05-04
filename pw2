@@ -1,0 +1,393 @@
+"""
+WebSphere Admin Script to Update J2C Authentication Alias Password
+This script searches for a specific username in all J2C authentication aliases
+and updates the password. Changes are synchronized to all nodes.
+Includes validation by testing datasource connections that use the updated aliases.
+"""
+
+import sys
+
+def log(message):
+    """Print log message"""
+    print("[INFO] %s" % message)
+
+def get_username_input():
+    """Get username from command line arguments or prompt"""
+    if len(sys.argv) > 1:
+        return sys.argv[0]
+    else:
+        log("ERROR: Username not provided")
+        log("Usage: wsadmin -lang jython -f update_j2c_password.py <username> <new_password>")
+        sys.exit(1)
+
+def get_password_input():
+    """Get password from command line arguments"""
+    if len(sys.argv) > 2:
+        return sys.argv[1]
+    else:
+        log("ERROR: Password not provided")
+        log("Usage: wsadmin -lang jython -f update_j2c_password.py <username> <new_password>")
+        sys.exit(1)
+
+def get_all_j2c_aliases():
+    """Get all J2C authentication aliases in the cell"""
+    aliases = []
+    
+    try:
+        # Get security configuration
+        security = AdminConfig.list('Security')
+        
+        if not security:
+            log("WARNING: Security configuration not found")
+            return aliases
+        
+        # Get JAASAuthData (J2C Authentication Data entries)
+        jaas_auth_data = AdminConfig.list('JAASAuthData', security).splitlines()
+        
+        log("Found %d J2C authentication alias(es)" % len(jaas_auth_data))
+        
+        return jaas_auth_data
+        
+    except Exception as e:
+        log("ERROR: Failed to retrieve J2C authentication aliases: %s" % str(e))
+        return aliases
+
+def update_j2c_password(alias, username, new_password):
+    """Update password for a J2C authentication alias"""
+    try:
+        alias_name = AdminConfig.showAttribute(alias, 'alias')
+        current_user = AdminConfig.showAttribute(alias, 'userId')
+        
+        if current_user == username:
+            log("  Found matching username in alias: %s" % alias_name)
+            
+            # Update the password
+            AdminConfig.modify(alias, [['password', new_password]])
+            log("  Password updated successfully for alias: %s" % alias_name)
+            return True
+        
+        return False
+        
+    except Exception as e:
+        log("  ERROR: Failed to update alias: %s" % str(e))
+        return False
+
+def get_all_datasources():
+    """Get all datasources across all scopes"""
+    datasources = []
+    
+    try:
+        # Get all cells
+        cells = AdminConfig.list('Cell').splitlines()
+        
+        for cell in cells:
+            # Get all nodes in the cell
+            nodes = AdminConfig.list('Node', cell).splitlines()
+            
+            for node in nodes:
+                # Get datasources at node scope
+                node_datasources = AdminConfig.list('DataSource', node).splitlines()
+                datasources.extend(node_datasources)
+            
+            # Get datasources at cell scope
+            cell_datasources = AdminConfig.list('DataSource', cell).splitlines()
+            datasources.extend(cell_datasources)
+        
+        # Get datasources at server scope
+        servers = AdminConfig.list('Server').splitlines()
+        for server in servers:
+            server_datasources = AdminConfig.list('DataSource', server).splitlines()
+            datasources.extend(server_datasources)
+        
+        # Remove duplicates
+        datasources = list(set(datasources))
+        
+        return datasources
+        
+    except Exception as e:
+        log("ERROR: Failed to retrieve datasources: %s" % str(e))
+        return []
+
+def get_datasources_using_alias(alias_name):
+    """Find all datasources that use a specific J2C authentication alias"""
+    datasources_using_alias = []
+    
+    log("\n  Searching for datasources using alias: %s" % alias_name)
+    
+    all_datasources = get_all_datasources()
+    
+    for datasource in all_datasources:
+        if datasource:
+            try:
+                ds_name = AdminConfig.showAttribute(datasource, 'name')
+                
+                # Check authDataAlias attribute
+                auth_alias = AdminConfig.showAttribute(datasource, 'authDataAlias')
+                
+                # Check component-managed authentication alias
+                mapping = AdminConfig.showAttribute(datasource, 'mapping')
+                if mapping:
+                    cm_auth_alias = AdminConfig.showAttribute(mapping, 'authDataAlias')
+                    if cm_auth_alias and alias_name in cm_auth_alias:
+                        datasources_using_alias.append((datasource, ds_name))
+                        log("    Found datasource (component-managed): %s" % ds_name)
+                        continue
+                
+                # Check container-managed authentication alias
+                if auth_alias and alias_name in auth_alias:
+                    datasources_using_alias.append((datasource, ds_name))
+                    log("    Found datasource (container-managed): %s" % ds_name)
+                    
+            except Exception as e:
+                log("    WARNING: Error checking datasource: %s" % str(e))
+    
+    return datasources_using_alias
+
+def test_datasource_connection(datasource, ds_name):
+    """Test connection for a datasource"""
+    try:
+        # Get the datasource MBean
+        ds_mbean = AdminControl.queryNames('type=DataSource,name=%s,*' % ds_name)
+        
+        if not ds_mbean:
+            log("    WARNING: DataSource MBean not found for '%s' (server may not be running)" % ds_name)
+            return None
+        
+        # Handle multiple MBeans (if datasource exists on multiple servers)
+        ds_mbeans = ds_mbean.splitlines()
+        
+        test_results = []
+        for mbean in ds_mbeans:
+            if mbean:
+                try:
+                    log("    Testing connection for '%s'..." % ds_name)
+                    result = AdminControl.invoke(mbean, 'testConnection')
+                    
+                    if result and 'Successful' in result:
+                        log("    SUCCESS: Connection test passed for '%s'" % ds_name)
+                        test_results.append(True)
+                    else:
+                        log("    FAILED: Connection test failed for '%s'" % ds_name)
+                        if result:
+                            log("    Result: %s" % result)
+                        test_results.append(False)
+                except Exception as e:
+                    log("    ERROR: Exception during connection test for '%s': %s" % (ds_name, str(e)))
+                    test_results.append(False)
+        
+        # Return True if at least one test passed
+        return any(test_results) if test_results else None
+        
+    except Exception as e:
+        log("    ERROR: Failed to test connection for '%s': %s" % (ds_name, str(e)))
+        return None
+
+def validate_updated_aliases(updated_aliases):
+    """Validate password changes by testing datasource connections"""
+    log("\n" + "=" * 70)
+    log("Validating Password Changes - Testing Datasource Connections")
+    log("=" * 70)
+    
+    if not updated_aliases:
+        log("No aliases were updated, skipping validation")
+        return
+    
+    total_datasources = 0
+    passed = 0
+    failed = 0
+    skipped = 0
+    
+    for alias_name in updated_aliases:
+        log("\nValidating alias: %s" % alias_name)
+        
+        # Find datasources using this alias
+        datasources = get_datasources_using_alias(alias_name)
+        
+        if not datasources:
+            log("  No datasources found using this alias")
+            continue
+        
+        log("  Found %d datasource(s) using this alias" % len(datasources))
+        total_datasources += len(datasources)
+        
+        # Test each datasource
+        for datasource, ds_name in datasources:
+            result = test_datasource_connection(datasource, ds_name)
+            
+            if result is True:
+                passed += 1
+            elif result is False:
+                failed += 1
+            else:
+                skipped += 1
+    
+    # Summary
+    log("\n" + "=" * 70)
+    log("Connection Test Summary:")
+    log("  Total datasources tested: %d" % total_datasources)
+    log("  Passed: %d" % passed)
+    log("  Failed: %d" % failed)
+    log("  Skipped (server not running): %d" % skipped)
+    log("=" * 70)
+    
+    if failed > 0:
+        log("\nWARNING: Some datasource connections failed!")
+        log("Possible reasons:")
+        log("  1. New password may be incorrect")
+        log("  2. Database account may be locked")
+        log("  3. Database server may be unreachable")
+        log("  4. Network connectivity issues")
+        log("\nPlease verify the password and database connectivity")
+    elif passed > 0:
+        log("\nSUCCESS: All tested datasource connections passed!")
+        log("Password update has been validated successfully")
+    elif skipped > 0:
+        log("\nINFO: All datasources skipped (servers not running)")
+        log("Please start the servers and test connections manually")
+
+def sync_all_nodes():
+    """Synchronize all active nodes in the cell"""
+    log("\n" + "=" * 70)
+    log("Synchronizing all active nodes...")
+    log("=" * 70)
+    
+    try:
+        # Get all nodes
+        nodes = AdminConfig.list('Node').splitlines()
+        
+        if not nodes:
+            log("  No nodes found to synchronize")
+            return True
+        
+        synced_count = 0
+        failed_nodes = []
+        
+        for node in nodes:
+            node_name = AdminConfig.showAttribute(node, 'name')
+            
+            # Skip the deployment manager node
+            if 'dmgr' in node_name.lower() or 'manager' in node_name.lower():
+                log("  Skipping deployment manager node: %s" % node_name)
+                continue
+            
+            try:
+                # Check if node is synchronized
+                sync_status = AdminControl.completeObjectName('type=NodeSync,node=%s,*' % node_name)
+                
+                if sync_status:
+                    log("  Synchronizing node: %s" % node_name)
+                    AdminControl.invoke(sync_status, 'sync')
+                    synced_count += 1
+                    log("  Node '%s' synchronized successfully" % node_name)
+                else:
+                    log("  Node '%s' is not active or cannot be synchronized" % node_name)
+                    failed_nodes.append(node_name)
+            except Exception as e:
+                log("  WARNING: Failed to sync node '%s': %s" % (node_name, str(e)))
+                failed_nodes.append(node_name)
+        
+        log("\nSynchronization Summary:")
+        log("  Successfully synced: %d node(s)" % synced_count)
+        if failed_nodes:
+            log("  Failed/Inactive nodes: %s" % ", ".join(failed_nodes))
+        
+        return len(failed_nodes) == 0
+        
+    except Exception as e:
+        log("WARNING: Error during node synchronization: %s" % str(e))
+        log("You may need to manually synchronize nodes from the admin console")
+        return False
+
+def main():
+    """Main execution function"""
+    log("=" * 70)
+    log("J2C Authentication Alias Password Update Script")
+    log("=" * 70)
+    
+    # Get username and password from arguments
+    username = get_username_input()
+    new_password = get_password_input()
+    
+    log("\nConfiguration:")
+    log("  Target Username: %s" % username)
+    log("  New Password: %s" % ("*" * len(new_password)))
+    log("=" * 70)
+    
+    # Get all J2C authentication aliases
+    log("\nRetrieving all J2C authentication aliases...")
+    aliases = get_all_j2c_aliases()
+    
+    if not aliases:
+        log("No J2C authentication aliases found. Exiting.")
+        return
+    
+    # Process each alias
+    log("\nSearching for username '%s' in aliases..." % username)
+    updated_count = 0
+    updated_alias_names = []
+    
+    for alias in aliases:
+        if alias:  # Skip empty entries
+            alias_name = AdminConfig.showAttribute(alias, 'alias')
+            current_user = AdminConfig.showAttribute(alias, 'userId')
+            
+            log("\nChecking alias: %s (user: %s)" % (alias_name, current_user))
+            
+            if update_j2c_password(alias, username, new_password):
+                updated_count += 1
+                updated_alias_names.append(alias_name)
+    
+    # Summary
+    log("\n" + "=" * 70)
+    log("Update Summary:")
+    log("  Total aliases checked: %d" % len(aliases))
+    log("  Aliases updated: %d" % updated_count)
+    if updated_alias_names:
+        log("  Updated aliases: %s" % ", ".join(updated_alias_names))
+    log("=" * 70)
+    
+    if updated_count > 0:
+        log("\nSaving configuration changes...")
+        try:
+            AdminConfig.save()
+            log("Configuration saved successfully!")
+            
+            # Synchronize nodes
+            sync_success = sync_all_nodes()
+            
+            if sync_success:
+                log("\nAll nodes synchronized successfully")
+            else:
+                log("\nWARNING: Some nodes failed to synchronize")
+                log("Please check the logs above and manually sync if needed")
+            
+            # Validate password changes by testing datasource connections
+            validate_updated_aliases(updated_alias_names)
+            
+            log("\n" + "=" * 70)
+            log("IMPORTANT: Next Steps")
+            log("=" * 70)
+            log("  1. Review connection test results above")
+            log("  2. If servers are not running, start them and test manually")
+            log("  3. No server restart required for J2C alias changes")
+            log("  4. Monitor application logs for authentication issues")
+            log("  5. Test application functionality that uses these aliases")
+            log("=" * 70)
+            
+        except Exception as e:
+            log("ERROR: Failed to save configuration!")
+            log("Error details: %s" % str(e))
+            log("Changes have NOT been persisted.")
+            raise
+    else:
+        log("\nNo aliases found with username '%s'. No changes made." % username)
+    
+    log("\n" + "=" * 70)
+    log("Script completed")
+    log("=" * 70)
+
+# Execute main function
+if __name__ == '__main__' or __name__ == 'main':
+    main()
+
+# Made with Bob
