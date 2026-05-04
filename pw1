@@ -1,0 +1,212 @@
+"""
+WebSphere Admin Script to Update J2C Authentication Alias Password
+This script searches for a specific username in all J2C authentication aliases
+and updates the password. Changes are synchronized to all nodes.
+"""
+
+import sys
+
+def log(message):
+    """Print log message"""
+    print("[INFO] %s" % message)
+
+def get_username_input():
+    """Get username from command line arguments or prompt"""
+    if len(sys.argv) > 1:
+        return sys.argv[0]
+    else:
+        log("ERROR: Username not provided")
+        log("Usage: wsadmin -lang jython -f update_j2c_password.py <username> <new_password>")
+        sys.exit(1)
+
+def get_password_input():
+    """Get password from command line arguments"""
+    if len(sys.argv) > 2:
+        return sys.argv[1]
+    else:
+        log("ERROR: Password not provided")
+        log("Usage: wsadmin -lang jython -f update_j2c_password.py <username> <new_password>")
+        sys.exit(1)
+
+def get_all_j2c_aliases():
+    """Get all J2C authentication aliases in the cell"""
+    aliases = []
+    
+    try:
+        # Get security configuration
+        security = AdminConfig.list('Security')
+        
+        if not security:
+            log("WARNING: Security configuration not found")
+            return aliases
+        
+        # Get JAASAuthData (J2C Authentication Data entries)
+        jaas_auth_data = AdminConfig.list('JAASAuthData', security).splitlines()
+        
+        log("Found %d J2C authentication alias(es)" % len(jaas_auth_data))
+        
+        return jaas_auth_data
+        
+    except Exception as e:
+        log("ERROR: Failed to retrieve J2C authentication aliases: %s" % str(e))
+        return aliases
+
+def update_j2c_password(alias, username, new_password):
+    """Update password for a J2C authentication alias"""
+    try:
+        alias_name = AdminConfig.showAttribute(alias, 'alias')
+        current_user = AdminConfig.showAttribute(alias, 'userId')
+        
+        if current_user == username:
+            log("  Found matching username in alias: %s" % alias_name)
+            
+            # Update the password
+            AdminConfig.modify(alias, [['password', new_password]])
+            log("  Password updated successfully for alias: %s" % alias_name)
+            return True
+        
+        return False
+        
+    except Exception as e:
+        log("  ERROR: Failed to update alias: %s" % str(e))
+        return False
+
+def sync_all_nodes():
+    """Synchronize all active nodes in the cell"""
+    log("\n" + "=" * 70)
+    log("Synchronizing all active nodes...")
+    log("=" * 70)
+    
+    try:
+        # Get all nodes
+        nodes = AdminConfig.list('Node').splitlines()
+        
+        if not nodes:
+            log("  No nodes found to synchronize")
+            return True
+        
+        synced_count = 0
+        failed_nodes = []
+        
+        for node in nodes:
+            node_name = AdminConfig.showAttribute(node, 'name')
+            
+            # Skip the deployment manager node
+            if 'dmgr' in node_name.lower() or 'manager' in node_name.lower():
+                log("  Skipping deployment manager node: %s" % node_name)
+                continue
+            
+            try:
+                # Check if node is synchronized
+                sync_status = AdminControl.completeObjectName('type=NodeSync,node=%s,*' % node_name)
+                
+                if sync_status:
+                    log("  Synchronizing node: %s" % node_name)
+                    AdminControl.invoke(sync_status, 'sync')
+                    synced_count += 1
+                    log("  Node '%s' synchronized successfully" % node_name)
+                else:
+                    log("  Node '%s' is not active or cannot be synchronized" % node_name)
+                    failed_nodes.append(node_name)
+            except Exception as e:
+                log("  WARNING: Failed to sync node '%s': %s" % (node_name, str(e)))
+                failed_nodes.append(node_name)
+        
+        log("\nSynchronization Summary:")
+        log("  Successfully synced: %d node(s)" % synced_count)
+        if failed_nodes:
+            log("  Failed/Inactive nodes: %s" % ", ".join(failed_nodes))
+        
+        return len(failed_nodes) == 0
+        
+    except Exception as e:
+        log("WARNING: Error during node synchronization: %s" % str(e))
+        log("You may need to manually synchronize nodes from the admin console")
+        return False
+
+def main():
+    """Main execution function"""
+    log("=" * 70)
+    log("J2C Authentication Alias Password Update Script")
+    log("=" * 70)
+    
+    # Get username and password from arguments
+    username = get_username_input()
+    new_password = get_password_input()
+    
+    log("\nConfiguration:")
+    log("  Target Username: %s" % username)
+    log("  New Password: %s" % ("*" * len(new_password)))
+    log("=" * 70)
+    
+    # Get all J2C authentication aliases
+    log("\nRetrieving all J2C authentication aliases...")
+    aliases = get_all_j2c_aliases()
+    
+    if not aliases:
+        log("No J2C authentication aliases found. Exiting.")
+        return
+    
+    # Process each alias
+    log("\nSearching for username '%s' in aliases..." % username)
+    updated_count = 0
+    
+    for alias in aliases:
+        if alias:  # Skip empty entries
+            alias_name = AdminConfig.showAttribute(alias, 'alias')
+            current_user = AdminConfig.showAttribute(alias, 'userId')
+            
+            log("\nChecking alias: %s (user: %s)" % (alias_name, current_user))
+            
+            if update_j2c_password(alias, username, new_password):
+                updated_count += 1
+    
+    # Summary
+    log("\n" + "=" * 70)
+    log("Update Summary:")
+    log("  Total aliases checked: %d" % len(aliases))
+    log("  Aliases updated: %d" % updated_count)
+    log("=" * 70)
+    
+    if updated_count > 0:
+        log("\nSaving configuration changes...")
+        try:
+            AdminConfig.save()
+            log("Configuration saved successfully!")
+            
+            # Synchronize nodes
+            sync_success = sync_all_nodes()
+            
+            if sync_success:
+                log("\nAll nodes synchronized successfully")
+            else:
+                log("\nWARNING: Some nodes failed to synchronize")
+                log("Please check the logs above and manually sync if needed")
+            
+            log("\n" + "=" * 70)
+            log("IMPORTANT: Next Steps")
+            log("=" * 70)
+            log("  1. Configuration changes have been saved and synced")
+            log("  2. Applications using these aliases will use the new password")
+            log("  3. No server restart is required for J2C alias changes")
+            log("  4. Test application connectivity to verify the password change")
+            log("  5. Monitor application logs for any authentication issues")
+            log("=" * 70)
+            
+        except Exception as e:
+            log("ERROR: Failed to save configuration!")
+            log("Error details: %s" % str(e))
+            log("Changes have NOT been persisted.")
+            raise
+    else:
+        log("\nNo aliases found with username '%s'. No changes made." % username)
+    
+    log("\n" + "=" * 70)
+    log("Script completed")
+    log("=" * 70)
+
+# Execute main function
+if __name__ == '__main__' or __name__ == 'main':
+    main()
+
+
