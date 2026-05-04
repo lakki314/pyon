@@ -1,0 +1,417 @@
+"""
+WebSphere Admin Script to Update Datasource Hostnames
+This script searches for specific hostnames in datasource configurations
+and replaces them with new hostnames, including alternative hostnames.
+Hostname mappings are read from a properties file.
+Includes node synchronization and connection testing validation.
+"""
+
+import sys
+import os
+
+# Properties file path (can be passed as argument or use default)
+PROPERTIES_FILE = "hostname_mapping.properties"
+
+def log(message):
+    """Print log message with timestamp"""
+    print("[INFO] %s" % message)
+
+def load_properties(properties_file):
+    """Load hostname mappings from properties file"""
+    properties = {}
+    
+    if not os.path.exists(properties_file):
+        log("ERROR: Properties file not found: %s" % properties_file)
+        sys.exit(1)
+    
+    log("Loading properties from: %s" % properties_file)
+    
+    try:
+        with open(properties_file, 'r') as f:
+            for line in f:
+                line = line.strip()
+                # Skip comments and empty lines
+                if line and not line.startswith('#') and not line.startswith('!'):
+                    if '=' in line:
+                        key, value = line.split('=', 1)
+                        properties[key.strip()] = value.strip()
+        
+        log("Loaded %d properties" % len(properties))
+        return properties
+    except Exception as e:
+        log("ERROR: Failed to load properties file: %s" % str(e))
+        sys.exit(1)
+
+def parse_hostname_list(hostname_string):
+    """Parse comma-separated hostname list"""
+    if not hostname_string:
+        return []
+    return [h.strip() for h in hostname_string.split(',') if h.strip()]
+
+def get_all_datasources():
+    """Get all datasources across all scopes"""
+    datasources = []
+    
+    # Get all cells
+    cells = AdminConfig.list('Cell').splitlines()
+    
+    for cell in cells:
+        # Get all nodes in the cell
+        nodes = AdminConfig.list('Node', cell).splitlines()
+        
+        for node in nodes:
+            # Get datasources at node scope
+            node_datasources = AdminConfig.list('DataSource', node).splitlines()
+            datasources.extend(node_datasources)
+        
+        # Get datasources at cell scope
+        cell_datasources = AdminConfig.list('DataSource', cell).splitlines()
+        datasources.extend(cell_datasources)
+    
+    # Get datasources at server scope
+    servers = AdminConfig.list('Server').splitlines()
+    for server in servers:
+        server_datasources = AdminConfig.list('DataSource', server).splitlines()
+        datasources.extend(server_datasources)
+    
+    # Remove duplicates
+    datasources = list(set(datasources))
+    
+    return datasources
+
+def update_hostname_in_property(property_set, property_name, old_value, new_value):
+    """Update a specific property value in a property set"""
+    if not property_set:
+        return False
+    
+    # Get all resource properties
+    properties = AdminConfig.list('J2EEResourceProperty', property_set).splitlines()
+    
+    for prop in properties:
+        name = AdminConfig.showAttribute(prop, 'name')
+        
+        if name == property_name:
+            current_value = AdminConfig.showAttribute(prop, 'value')
+            
+            if current_value and old_value in current_value:
+                # Replace the old hostname with new hostname
+                new_prop_value = current_value.replace(old_value, new_value)
+                AdminConfig.modify(prop, [['value', new_prop_value]])
+                log("  Updated property '%s': '%s' -> '%s'" % (property_name, current_value, new_prop_value))
+                return True
+    
+    return False
+
+def update_alternative_hostnames(property_set, old_hostnames, new_hostnames):
+    """Update alternative hostnames (comma-separated list)"""
+    if not property_set:
+        return False
+    
+    properties = AdminConfig.list('J2EEResourceProperty', property_set).splitlines()
+    
+    for prop in properties:
+        name = AdminConfig.showAttribute(prop, 'name')
+        
+        # Common property names for alternative hostnames
+        if name in ['clientRerouteAlternateServerName', 'alternateServers', 'failoverServers']:
+            current_value = AdminConfig.showAttribute(prop, 'value')
+            
+            if current_value:
+                updated = False
+                new_value = current_value
+                
+                # Replace each old hostname with corresponding new hostname
+                for i, old_host in enumerate(old_hostnames):
+                    if old_host in new_value:
+                        if i < len(new_hostnames):
+                            new_value = new_value.replace(old_host, new_hostnames[i])
+                            updated = True
+                
+                if updated:
+                    AdminConfig.modify(prop, [['value', new_value]])
+                    log("  Updated alternative hostnames in '%s': '%s' -> '%s'" % (name, current_value, new_value))
+                    return True
+    
+    return False
+
+def process_datasource(datasource, old_hostname, new_hostname, old_alt_hostnames, new_alt_hostnames):
+    """Process a single datasource and update hostnames"""
+    ds_name = AdminConfig.showAttribute(datasource, 'name')
+    log("\nProcessing DataSource: %s" % ds_name)
+    
+    updated = False
+    
+    # Get property set
+    property_set = AdminConfig.showAttribute(datasource, 'propertySet')
+    
+    if property_set:
+        # Update primary hostname
+        if update_hostname_in_property(property_set, 'serverName', old_hostname, new_hostname):
+            updated = True
+        
+        # Also check for 'databaseName' property (some datasources use this)
+        if update_hostname_in_property(property_set, 'databaseName', old_hostname, new_hostname):
+            updated = True
+        
+        # Update URL if it contains hostname
+        if update_hostname_in_property(property_set, 'URL', old_hostname, new_hostname):
+            updated = True
+        
+        # Update alternative hostnames
+        if update_alternative_hostnames(property_set, old_alt_hostnames, new_alt_hostnames):
+            updated = True
+    
+    # Check connection pool properties
+    connection_pool = AdminConfig.showAttribute(datasource, 'connectionPool')
+    if connection_pool:
+        pool_property_set = AdminConfig.showAttribute(connection_pool, 'propertySet')
+        if pool_property_set:
+            if update_hostname_in_property(pool_property_set, 'serverName', old_hostname, new_hostname):
+                updated = True
+    
+    if updated:
+        log("  DataSource '%s' has been updated" % ds_name)
+    else:
+        log("  No changes needed for DataSource '%s'" % ds_name)
+    
+    return updated
+
+def sync_all_nodes():
+    """Synchronize all active nodes in the cell"""
+    log("\n" + "=" * 70)
+    log("Synchronizing all active nodes...")
+    log("=" * 70)
+    
+    try:
+        # Get all nodes
+        nodes = AdminConfig.list('Node').splitlines()
+        
+        if not nodes:
+            log("  No nodes found to synchronize")
+            return True
+        
+        synced_count = 0
+        failed_nodes = []
+        
+        for node in nodes:
+            node_name = AdminConfig.showAttribute(node, 'name')
+            
+            # Skip the deployment manager node
+            if 'dmgr' in node_name.lower() or 'manager' in node_name.lower():
+                log("  Skipping deployment manager node: %s" % node_name)
+                continue
+            
+            try:
+                # Check if node is synchronized
+                sync_status = AdminControl.completeObjectName('type=NodeSync,node=%s,*' % node_name)
+                
+                if sync_status:
+                    log("  Synchronizing node: %s" % node_name)
+                    AdminControl.invoke(sync_status, 'sync')
+                    synced_count += 1
+                    log("  Node '%s' synchronized successfully" % node_name)
+                else:
+                    log("  Node '%s' is not active or cannot be synchronized" % node_name)
+                    failed_nodes.append(node_name)
+            except Exception as e:
+                log("  WARNING: Failed to sync node '%s': %s" % (node_name, str(e)))
+                failed_nodes.append(node_name)
+        
+        log("\nSynchronization Summary:")
+        log("  Successfully synced: %d node(s)" % synced_count)
+        if failed_nodes:
+            log("  Failed/Inactive nodes: %s" % ", ".join(failed_nodes))
+        
+        return len(failed_nodes) == 0
+        
+    except Exception as e:
+        log("WARNING: Error during node synchronization: %s" % str(e))
+        log("You may need to manually synchronize nodes from the admin console")
+        return False
+
+def test_datasource_connection(datasource, ds_name):
+    """Test connection for a datasource"""
+    try:
+        # Get the datasource MBean
+        ds_mbean = AdminControl.queryNames('type=DataSource,name=%s,*' % ds_name)
+        
+        if not ds_mbean:
+            log("  WARNING: DataSource MBean not found for '%s' (server may not be running)" % ds_name)
+            return None
+        
+        # Handle multiple MBeans (if datasource exists on multiple servers)
+        ds_mbeans = ds_mbean.splitlines()
+        
+        test_results = []
+        for mbean in ds_mbeans:
+            if mbean:
+                try:
+                    log("  Testing connection for '%s'..." % ds_name)
+                    result = AdminControl.invoke(mbean, 'testConnection')
+                    
+                    if result and 'Successful' in result:
+                        log("  SUCCESS: Connection test passed for '%s'" % ds_name)
+                        test_results.append(True)
+                    else:
+                        log("  FAILED: Connection test failed for '%s'" % ds_name)
+                        log("  Result: %s" % result)
+                        test_results.append(False)
+                except Exception as e:
+                    log("  ERROR: Exception during connection test for '%s': %s" % (ds_name, str(e)))
+                    test_results.append(False)
+        
+        # Return True if at least one test passed
+        return any(test_results) if test_results else None
+        
+    except Exception as e:
+        log("  ERROR: Failed to test connection for '%s': %s" % (ds_name, str(e)))
+        return None
+
+def validate_datasource_connections(updated_datasources):
+    """Validate connections for all updated datasources"""
+    log("\n" + "=" * 70)
+    log("Validating DataSource Connections")
+    log("=" * 70)
+    
+    if not updated_datasources:
+        log("No datasources to validate")
+        return
+    
+    passed = 0
+    failed = 0
+    skipped = 0
+    
+    for datasource in updated_datasources:
+        ds_name = AdminConfig.showAttribute(datasource, 'name')
+        log("\nValidating: %s" % ds_name)
+        
+        result = test_datasource_connection(datasource, ds_name)
+        
+        if result is True:
+            passed += 1
+        elif result is False:
+            failed += 1
+        else:
+            skipped += 1
+    
+    log("\n" + "=" * 70)
+    log("Connection Test Summary:")
+    log("  Total datasources tested: %d" % len(updated_datasources))
+    log("  Passed: %d" % passed)
+    log("  Failed: %d" % failed)
+    log("  Skipped (server not running): %d" % skipped)
+    log("=" * 70)
+    
+    if failed > 0:
+        log("\nWARNING: Some datasource connections failed!")
+        log("Please review the errors above and verify:")
+        log("  1. Database servers are accessible")
+        log("  2. Hostnames are correct")
+        log("  3. Network connectivity is working")
+        log("  4. Database credentials are valid")
+
+def main():
+    """Main execution function"""
+    log("=" * 70)
+    log("Starting DataSource Hostname Update Script")
+    log("=" * 70)
+    
+    # Check if properties file is passed as argument
+    properties_file = PROPERTIES_FILE
+    if len(sys.argv) > 1:
+        properties_file = sys.argv[0]
+        log("Using properties file from argument: %s" % properties_file)
+    
+    # Load properties
+    properties = load_properties(properties_file)
+    
+    # Get hostname mappings from properties
+    old_hostname = properties.get('old.hostname', '')
+    new_hostname = properties.get('new.hostname', '')
+    old_alt_hostnames_str = properties.get('old.alternative.hostnames', '')
+    new_alt_hostnames_str = properties.get('new.alternative.hostnames', '')
+    
+    # Validate required properties
+    if not old_hostname or not new_hostname:
+        log("ERROR: Required properties 'old.hostname' and 'new.hostname' must be specified")
+        sys.exit(1)
+    
+    # Parse alternative hostnames
+    old_alt_hostnames = parse_hostname_list(old_alt_hostnames_str)
+    new_alt_hostnames = parse_hostname_list(new_alt_hostnames_str)
+    
+    log("\nConfiguration:")
+    log("  Old Hostname: %s" % old_hostname)
+    log("  New Hostname: %s" % new_hostname)
+    log("  Old Alternative Hostnames: %s" % ", ".join(old_alt_hostnames) if old_alt_hostnames else "  Old Alternative Hostnames: (none)")
+    log("  New Alternative Hostnames: %s" % ", ".join(new_alt_hostnames) if new_alt_hostnames else "  New Alternative Hostnames: (none)")
+    log("=" * 70)
+    
+    # Get all datasources
+    log("\nRetrieving all datasources...")
+    datasources = get_all_datasources()
+    log("Found %d datasource(s)" % len(datasources))
+    
+    if not datasources:
+        log("No datasources found. Exiting.")
+        return
+    
+    # Process each datasource
+    updated_datasources = []
+    for datasource in datasources:
+        if datasource:  # Skip empty entries
+            if process_datasource(datasource, old_hostname, new_hostname, old_alt_hostnames, new_alt_hostnames):
+                updated_datasources.append(datasource)
+    
+    # Save configuration
+    log("\n" + "=" * 70)
+    log("Update Summary:")
+    log("  Total datasources processed: %d" % len(datasources))
+    log("  Datasources updated: %d" % len(updated_datasources))
+    log("=" * 70)
+    
+    if updated_datasources:
+        log("\nSaving configuration changes...")
+        try:
+            AdminConfig.save()
+            log("Configuration saved successfully!")
+            
+            # Synchronize nodes
+            sync_success = sync_all_nodes()
+            
+            if sync_success:
+                log("\nAll nodes synchronized successfully")
+            else:
+                log("\nWARNING: Some nodes failed to synchronize")
+                log("Please check the logs above and manually sync if needed")
+            
+            # Validate datasource connections
+            validate_datasource_connections(updated_datasources)
+            
+            log("\n" + "=" * 70)
+            log("IMPORTANT: Next Steps")
+            log("=" * 70)
+            log("  1. Review connection test results above")
+            log("  2. If servers are not running, start them and test connections manually")
+            log("  3. Restart affected servers if not already done")
+            log("  4. Verify application functionality")
+            log("  5. Monitor application logs for any database connection issues")
+            log("=" * 70)
+            
+        except Exception as e:
+            log("ERROR: Failed to save configuration!")
+            log("Error details: %s" % str(e))
+            log("Changes have NOT been persisted.")
+            raise
+    else:
+        log("\nNo changes were made. Configuration not saved.")
+    
+    log("\n" + "=" * 70)
+    log("Script completed")
+    log("=" * 70)
+
+# Execute main function
+if __name__ == '__main__' or __name__ == 'main':
+    main()
+
+
