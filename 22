@@ -1,0 +1,685 @@
+You are right: for your design, reconcile should not use a CyberArk username/password in the playbook. The workable pattern is certificate-protected Shared Logon to get an API token, then call the reconcile REST endpoint with that token and the same client cert/key.
+
+Thought for 1m 24s
+
+Yes — then remove username/password authentication completely.
+
+Correct pattern:
+
+Retrieve: use cyberark.pas.cyberark_credential with client_cert and client_key.
+Reconcile: use PVWA Shared Logon with client certificate/key to get the REST token, then call the CyberArk reconcile endpoint with that token and the same cert/key.
+Do not use cyberark_authentication with username/password.
+
+The reason: cyberark_credential directly supports client_cert and client_key for CCP retrieval, but cyberark_account requires a cyberark_session and does not expose client_cert/client_key parameters. CyberArk’s Shared Logon API returns a LogonResult token, and CyberArk’s reconcile API requires an Authorization token header.
+
+Below is the corrected role.
+
+Role layout
+roles/
+  cyberark_cert_password/
+    defaults/
+      main.yml
+    tasks/
+      main.yml
+      build_accounts.yml
+      retrieve_one.yml
+      reconcile_one.yml
+    meta/
+      main.yml
+    files/
+      client.pem
+      client.key
+defaults/main.yml
+---
+# User can pass mode: retrieve or mode: reconcile
+cyberark_mode: "{{ mode | default('retrieve') }}"
+
+# CCP URL for password retrieval.
+# Example: https://ccp.example.com
+cyberark_ccp_api_base_url: ""
+
+# PVWA base URL for reconcile APIs.
+# Example: https://pvwa.example.com
+# Do not include /PasswordVault here.
+cyberark_pvwa_base_url: ""
+
+# CyberArk CCP Application ID.
+cyberark_app_id: ""
+
+# Default safe. Can be overridden per account.
+cyberark_safe: ""
+
+# Client cert/key.
+# If these are blank, role uses files/client.pem and files/client.key.
+cyberark_client_cert_path: ""
+cyberark_client_key_path: ""
+cyberark_client_cert_file: "client.pem"
+cyberark_client_key_file: "client.key"
+
+cyberark_validate_certs: true
+cyberark_connection_timeout: 60
+cyberark_query_format: "Exact"
+cyberark_reason: ""
+cyberark_fail_request_on_password_change: false
+
+# Simple input.
+# Example:
+# was_user: wasadmin
+# mq_user: mqm
+# cyberark_user_vars:
+#   - was_user
+#   - mq_user
+#
+# This sets:
+# was_password
+# mq_password
+cyberark_user_vars: []
+
+# Advanced input.
+# Use this if safes/address/platform/account_id differ per account.
+#
+# cyberark_accounts:
+#   - name: was
+#     username: "{{ was_user }}"
+#     safe: "WAS_SAFE"
+#     address: "server01.example.com"
+#     platform_id: "UnixSSH"
+#     password_fact: "was_password"
+#     account_id: "optional_account_id_for_reconcile"
+cyberark_accounts: []
+
+cyberark_folder: ""
+cyberark_address: ""
+cyberark_object: ""
+cyberark_policy_id: ""
+cyberark_platform_id: ""
+
+# Reconcile behavior.
+cyberark_retrieve_after_reconcile: true
+cyberark_reconcile_force: false
+cyberark_reconcile_retries: 30
+cyberark_reconcile_delay: 20
+
+# If true, role fails when multiple CyberArk accounts match safe/user/address/platform.
+cyberark_fail_on_multiple_matches: true
+
+# Hide password/token/cert-sensitive output.
+cyberark_no_log: true
+tasks/main.yml
+---
+- name: Resolve CyberArk mode
+  set_fact:
+    __cyberark_mode: "{{ cyberark_mode | lower }}"
+
+- name: Validate CyberArk mode
+  assert:
+    that:
+      - __cyberark_mode in ['retrieve', 'reconcile']
+    fail_msg: "mode/cyberark_mode must be retrieve or reconcile."
+
+- name: Validate common CyberArk settings
+  assert:
+    that:
+      - cyberark_ccp_api_base_url | length > 0
+      - cyberark_app_id | length > 0
+      - cyberark_safe | length > 0 or cyberark_accounts | length > 0
+    fail_msg: >
+      Missing required CyberArk variables. Set cyberark_ccp_api_base_url,
+      cyberark_app_id, and cyberark_safe, or provide safe per cyberark_accounts item.
+
+- name: Validate reconcile PVWA URL
+  assert:
+    that:
+      - cyberark_pvwa_base_url | length > 0
+    fail_msg: "cyberark_pvwa_base_url is required when mode is reconcile."
+  when: __cyberark_mode == 'reconcile'
+
+- name: Resolve client certificate and key paths
+  set_fact:
+    __cyberark_client_cert_path: >-
+      {{
+        cyberark_client_cert_path
+        if (cyberark_client_cert_path | length > 0)
+        else role_path ~ '/files/' ~ cyberark_client_cert_file
+      }}
+    __cyberark_client_key_path: >-
+      {{
+        cyberark_client_key_path
+        if (cyberark_client_key_path | length > 0)
+        else role_path ~ '/files/' ~ cyberark_client_key_file
+      }}
+  no_log: "{{ cyberark_no_log }}"
+
+- name: Check client certificate exists on controller
+  stat:
+    path: "{{ __cyberark_client_cert_path }}"
+  register: __cyberark_cert_stat
+  delegate_to: localhost
+  no_log: "{{ cyberark_no_log }}"
+
+- name: Check client key exists on controller
+  stat:
+    path: "{{ __cyberark_client_key_path }}"
+  register: __cyberark_key_stat
+  delegate_to: localhost
+  no_log: "{{ cyberark_no_log }}"
+
+- name: Validate client certificate and key
+  assert:
+    that:
+      - __cyberark_cert_stat.stat.exists
+      - __cyberark_key_stat.stat.exists
+    fail_msg: >
+      Client cert/key not found on controller.
+      Expected cert={{ __cyberark_client_cert_path }},
+      key={{ __cyberark_client_key_path }}.
+  no_log: "{{ cyberark_no_log }}"
+
+- name: Build normalized CyberArk account list
+  include_tasks: build_accounts.yml
+
+- name: Retrieve CyberArk password facts
+  include_tasks: retrieve_one.yml
+  loop: "{{ __cyberark_accounts }}"
+  loop_control:
+    loop_var: __cyberark_account
+    label: "{{ __cyberark_account.name | default(__cyberark_account.input_var | default('account')) }}"
+  when: __cyberark_mode == 'retrieve'
+
+- name: Cert-auth shared logon to CyberArk PVWA for reconcile
+  ansible.builtin.uri:
+    url: "{{ cyberark_pvwa_base_url | regex_replace('/+$', '') }}/PasswordVault/WebServices/auth/Shared/RestfulAuthenticationService.svc/Logon/"
+    method: POST
+    client_cert: "{{ __cyberark_client_cert_path }}"
+    client_key: "{{ __cyberark_client_key_path }}"
+    validate_certs: "{{ cyberark_validate_certs }}"
+    headers:
+      Content-Type: "application/json"
+    body_format: json
+    body: {}
+    return_content: true
+    status_code: 200
+    timeout: "{{ cyberark_connection_timeout }}"
+  register: __cyberark_shared_logon
+  delegate_to: localhost
+  no_log: "{{ cyberark_no_log }}"
+  when: __cyberark_mode == 'reconcile'
+
+- name: Save CyberArk shared logon token
+  set_fact:
+    __cyberark_shared_token: "{{ __cyberark_shared_logon.json.LogonResult }}"
+  no_log: "{{ cyberark_no_log }}"
+  when: __cyberark_mode == 'reconcile'
+
+- name: Reconcile CyberArk passwords with cert-auth token
+  include_tasks: reconcile_one.yml
+  loop: "{{ __cyberark_accounts }}"
+  loop_control:
+    loop_var: __cyberark_account
+    label: "{{ __cyberark_account.name | default(__cyberark_account.input_var | default('account')) }}"
+  when: __cyberark_mode == 'reconcile'
+
+- name: Cert-auth shared logoff from CyberArk PVWA
+  ansible.builtin.uri:
+    url: "{{ cyberark_pvwa_base_url | regex_replace('/+$', '') }}/PasswordVault/WebServices/auth/Shared/RestfulAuthenticationService.svc/Logoff/"
+    method: POST
+    client_cert: "{{ __cyberark_client_cert_path }}"
+    client_key: "{{ __cyberark_client_key_path }}"
+    validate_certs: "{{ cyberark_validate_certs }}"
+    headers:
+      Content-Type: "application/json"
+      Authorization: "{{ __cyberark_shared_token }}"
+    body_format: json
+    body: {}
+    return_content: true
+    status_code:
+      - 200
+      - 204
+    timeout: "{{ cyberark_connection_timeout }}"
+  delegate_to: localhost
+  no_log: "{{ cyberark_no_log }}"
+  when:
+    - __cyberark_mode == 'reconcile'
+    - __cyberark_shared_token is defined
+tasks/build_accounts.yml
+---
+- name: Initialize normalized account list
+  set_fact:
+    __cyberark_accounts: []
+
+- name: Use advanced cyberark_accounts input when provided
+  set_fact:
+    __cyberark_accounts: "{{ cyberark_accounts }}"
+  when: cyberark_accounts | length > 0
+  no_log: "{{ cyberark_no_log }}"
+
+- name: Validate simple cyberark_user_vars input
+  assert:
+    that:
+      - item is match('^.+_user$')
+      - item in vars
+    fail_msg: >
+      Each cyberark_user_vars item must be a defined variable ending in _user.
+      Example: was_user: wasadmin and cyberark_user_vars: ['was_user'].
+  loop: "{{ cyberark_user_vars }}"
+  when: cyberark_accounts | length == 0
+
+- name: Build account list from simple user vars
+  set_fact:
+    __cyberark_accounts: >-
+      {{
+        __cyberark_accounts + [
+          {
+            'name': item | regex_replace('_user$', ''),
+            'input_var': item,
+            'password_fact': (item | regex_replace('_user$', '')) ~ '_password'
+          }
+        ]
+      }}
+  loop: "{{ cyberark_user_vars }}"
+  when: cyberark_accounts | length == 0
+  no_log: "{{ cyberark_no_log }}"
+
+- name: Validate at least one CyberArk account requested
+  assert:
+    that:
+      - __cyberark_accounts | length > 0
+    fail_msg: "No accounts requested. Set cyberark_user_vars or cyberark_accounts."
+tasks/retrieve_one.yml
+---
+- name: Resolve account fields for retrieval
+  set_fact:
+    __ca_name: "{{ __cyberark_account.name | default(__cyberark_account.input_var | regex_replace('_user$', '')) }}"
+    __ca_username: "{{ __cyberark_account.username | default(lookup('vars', __cyberark_account.input_var)) }}"
+    __ca_password_fact: >-
+      {{
+        __cyberark_account.password_fact
+        | default((__cyberark_account.name | default(__cyberark_account.input_var | regex_replace('_user$', ''))) ~ '_password')
+      }}
+    __ca_safe: "{{ __cyberark_account.safe | default(cyberark_safe) }}"
+    __ca_folder: "{{ __cyberark_account.folder | default(cyberark_folder) }}"
+    __ca_address: "{{ __cyberark_account.address | default(cyberark_address) }}"
+    __ca_object: "{{ __cyberark_account.object | default(cyberark_object) }}"
+    __ca_policy_id: "{{ __cyberark_account.policy_id | default(cyberark_policy_id) }}"
+  no_log: "{{ cyberark_no_log }}"
+
+- name: Build CCP query
+  set_fact:
+    __ca_query_parts: >-
+      {{
+        [
+          'Safe=' ~ __ca_safe,
+          'UserName=' ~ __ca_username
+        ]
+        + (['Folder=' ~ __ca_folder] if (__ca_folder | length > 0) else [])
+        + (['Address=' ~ __ca_address] if (__ca_address | length > 0) else [])
+        + (['Object=' ~ __ca_object] if (__ca_object | length > 0) else [])
+        + (['PolicyID=' ~ __ca_policy_id] if (__ca_policy_id | length > 0) else [])
+      }}
+  no_log: "{{ cyberark_no_log }}"
+
+- name: Retrieve password from CyberArk CCP using client certificate
+  cyberark.pas.cyberark_credential:
+    api_base_url: "{{ cyberark_ccp_api_base_url }}"
+    validate_certs: "{{ cyberark_validate_certs }}"
+    client_cert: "{{ __cyberark_client_cert_path }}"
+    client_key: "{{ __cyberark_client_key_path }}"
+    app_id: "{{ cyberark_app_id }}"
+    query: "{{ __ca_query_parts | join(';') }}"
+    connection_timeout: "{{ cyberark_connection_timeout }}"
+    query_format: "{{ cyberark_query_format }}"
+    fail_request_on_password_change: "{{ cyberark_fail_request_on_password_change }}"
+    reason: "{{ cyberark_reason if cyberark_reason | length > 0 else omit }}"
+  register: __ca_retrieve
+  delegate_to: localhost
+  changed_when: false
+  no_log: "{{ cyberark_no_log }}"
+
+- name: Set dynamic password fact
+  set_fact:
+    "{{ __ca_password_fact }}": "{{ __ca_retrieve.result.Content }}"
+  no_log: "{{ cyberark_no_log }}"
+
+- name: Set sanitized retrieval status
+  set_fact:
+    cyberark_password_status: >-
+      {{
+        cyberark_password_status | default({}) |
+        combine({
+          __ca_name: {
+            'mode': 'retrieve',
+            'status': 'retrieved',
+            'safe': __ca_safe,
+            'username': __ca_username,
+            'password_fact': __ca_password_fact,
+            'changed': false
+          }
+        }, recursive=True)
+      }}
+tasks/reconcile_one.yml
+---
+- name: Resolve account fields for reconcile
+  set_fact:
+    __ca_name: "{{ __cyberark_account.name | default(__cyberark_account.input_var | regex_replace('_user$', '')) }}"
+    __ca_username: "{{ __cyberark_account.username | default(lookup('vars', __cyberark_account.input_var)) }}"
+    __ca_password_fact: >-
+      {{
+        __cyberark_account.password_fact
+        | default((__cyberark_account.name | default(__cyberark_account.input_var | regex_replace('_user$', ''))) ~ '_password')
+      }}
+    __ca_safe: "{{ __cyberark_account.safe | default(cyberark_safe) }}"
+    __ca_folder: "{{ __cyberark_account.folder | default(cyberark_folder) }}"
+    __ca_address: "{{ __cyberark_account.address | default(cyberark_address) }}"
+    __ca_object: "{{ __cyberark_account.object | default(cyberark_object) }}"
+    __ca_policy_id: "{{ __cyberark_account.policy_id | default(cyberark_policy_id) }}"
+    __ca_platform_id: "{{ __cyberark_account.platform_id | default(cyberark_platform_id) }}"
+    __ca_input_account_id: "{{ __cyberark_account.account_id | default('') }}"
+  no_log: "{{ cyberark_no_log }}"
+
+- name: Build CCP query for reconcile precheck
+  set_fact:
+    __ca_query_parts: >-
+      {{
+        [
+          'Safe=' ~ __ca_safe,
+          'UserName=' ~ __ca_username
+        ]
+        + (['Folder=' ~ __ca_folder] if (__ca_folder | length > 0) else [])
+        + (['Address=' ~ __ca_address] if (__ca_address | length > 0) else [])
+        + (['Object=' ~ __ca_object] if (__ca_object | length > 0) else [])
+        + (['PolicyID=' ~ __ca_policy_id] if (__ca_policy_id | length > 0) else [])
+      }}
+  no_log: "{{ cyberark_no_log }}"
+
+- name: Check current password-change status using CCP
+  cyberark.pas.cyberark_credential:
+    api_base_url: "{{ cyberark_ccp_api_base_url }}"
+    validate_certs: "{{ cyberark_validate_certs }}"
+    client_cert: "{{ __cyberark_client_cert_path }}"
+    client_key: "{{ __cyberark_client_key_path }}"
+    app_id: "{{ cyberark_app_id }}"
+    query: "{{ __ca_query_parts | join(';') }}"
+    connection_timeout: "{{ cyberark_connection_timeout }}"
+    query_format: "{{ cyberark_query_format }}"
+    fail_request_on_password_change: false
+    reason: "{{ cyberark_reason if cyberark_reason | length > 0 else omit }}"
+  register: __ca_precheck
+  delegate_to: localhost
+  changed_when: false
+  no_log: "{{ cyberark_no_log }}"
+
+- name: Set password change in-process flag
+  set_fact:
+    __ca_password_change_in_process: "{{ __ca_precheck.result.PasswordChangeInProcess | default(false) | bool }}"
+  no_log: "{{ cyberark_no_log }}"
+
+- name: Build CyberArk account search filter
+  set_fact:
+    __ca_account_search_filter: "safeName eq {{ __ca_safe }}"
+  no_log: "{{ cyberark_no_log }}"
+  when: __ca_input_account_id | length == 0
+
+- name: Search CyberArk account in PVWA by safe
+  ansible.builtin.uri:
+    url: "{{ cyberark_pvwa_base_url | regex_replace('/+$', '') }}/PasswordVault/API/Accounts?filter={{ __ca_account_search_filter | urlencode }}&limit=1000"
+    method: GET
+    client_cert: "{{ __cyberark_client_cert_path }}"
+    client_key: "{{ __cyberark_client_key_path }}"
+    validate_certs: "{{ cyberark_validate_certs }}"
+    headers:
+      Content-Type: "application/json"
+      Authorization: "{{ __cyberark_shared_token }}"
+    return_content: true
+    status_code: 200
+    timeout: "{{ cyberark_connection_timeout }}"
+  register: __ca_account_search
+  delegate_to: localhost
+  no_log: "{{ cyberark_no_log }}"
+  when: __ca_input_account_id | length == 0
+
+- name: Filter CyberArk account candidates
+  set_fact:
+    __ca_account_candidates: >-
+      {{
+        (__ca_account_search.json.value | default([]))
+        | selectattr('userName', 'equalto', __ca_username)
+        | list
+      }}
+  no_log: "{{ cyberark_no_log }}"
+  when: __ca_input_account_id | length == 0
+
+- name: Filter candidates by address when supplied
+  set_fact:
+    __ca_account_candidates: >-
+      {{
+        __ca_account_candidates
+        | selectattr('address', 'equalto', __ca_address)
+        | list
+      }}
+  no_log: "{{ cyberark_no_log }}"
+  when:
+    - __ca_input_account_id | length == 0
+    - __ca_address | length > 0
+
+- name: Filter candidates by platform when supplied
+  set_fact:
+    __ca_account_candidates: >-
+      {{
+        __ca_account_candidates
+        | selectattr('platformId', 'equalto', __ca_platform_id)
+        | list
+      }}
+  no_log: "{{ cyberark_no_log }}"
+  when:
+    - __ca_input_account_id | length == 0
+    - __ca_platform_id | length > 0
+
+- name: Validate unique CyberArk account match
+  assert:
+    that:
+      - __ca_account_candidates | length == 1
+    fail_msg: >-
+      Could not uniquely identify CyberArk account for safe={{ __ca_safe }},
+      username={{ __ca_username }}, address={{ __ca_address | default('') }},
+      platform={{ __ca_platform_id | default('') }}.
+      Matches found={{ __ca_account_candidates | length }}.
+      Provide account_id in cyberark_accounts to avoid ambiguity.
+  when:
+    - __ca_input_account_id | length == 0
+    - cyberark_fail_on_multiple_matches | bool
+  no_log: "{{ cyberark_no_log }}"
+
+- name: Resolve CyberArk account id
+  set_fact:
+    __ca_account_id: >-
+      {{
+        __ca_input_account_id
+        if (__ca_input_account_id | length > 0)
+        else (__ca_account_candidates[0].id)
+      }}
+  no_log: "{{ cyberark_no_log }}"
+
+- name: Submit CyberArk reconcile using cert-auth shared token
+  ansible.builtin.uri:
+    url: "{{ cyberark_pvwa_base_url | regex_replace('/+$', '') }}/PasswordVault/API/Accounts/{{ __ca_account_id }}/Reconcile/"
+    method: POST
+    client_cert: "{{ __cyberark_client_cert_path }}"
+    client_key: "{{ __cyberark_client_key_path }}"
+    validate_certs: "{{ cyberark_validate_certs }}"
+    headers:
+      Content-Type: "application/json"
+      Authorization: "{{ __cyberark_shared_token }}"
+    body_format: json
+    body: {}
+    return_content: true
+    status_code:
+      - 200
+      - 201
+      - 202
+      - 204
+    timeout: "{{ cyberark_connection_timeout }}"
+  register: __ca_reconcile_submit
+  delegate_to: localhost
+  changed_when: true
+  no_log: "{{ cyberark_no_log }}"
+  when:
+    - cyberark_reconcile_force | bool or not __ca_password_change_in_process | bool
+
+- name: Wait until CyberArk reconcile/password change is complete
+  cyberark.pas.cyberark_credential:
+    api_base_url: "{{ cyberark_ccp_api_base_url }}"
+    validate_certs: "{{ cyberark_validate_certs }}"
+    client_cert: "{{ __cyberark_client_cert_path }}"
+    client_key: "{{ __cyberark_client_key_path }}"
+    app_id: "{{ cyberark_app_id }}"
+    query: "{{ __ca_query_parts | join(';') }}"
+    connection_timeout: "{{ cyberark_connection_timeout }}"
+    query_format: "{{ cyberark_query_format }}"
+    fail_request_on_password_change: false
+    reason: "{{ cyberark_reason if cyberark_reason | length > 0 else omit }}"
+  register: __ca_after_reconcile
+  delegate_to: localhost
+  changed_when: false
+  until: not (__ca_after_reconcile.result.PasswordChangeInProcess | default(false) | bool)
+  retries: "{{ cyberark_reconcile_retries }}"
+  delay: "{{ cyberark_reconcile_delay }}"
+  no_log: "{{ cyberark_no_log }}"
+  when:
+    - cyberark_retrieve_after_reconcile | bool
+    - cyberark_reconcile_force | bool or not __ca_password_change_in_process | bool
+
+- name: Set dynamic password fact after reconcile
+  set_fact:
+    "{{ __ca_password_fact }}": "{{ __ca_after_reconcile.result.Content }}"
+  no_log: "{{ cyberark_no_log }}"
+  when:
+    - cyberark_retrieve_after_reconcile | bool
+    - __ca_after_reconcile is defined
+    - __ca_after_reconcile.result.Content is defined
+
+- name: Set sanitized reconcile status
+  set_fact:
+    cyberark_password_status: >-
+      {{
+        cyberark_password_status | default({}) |
+        combine({
+          __ca_name: {
+            'mode': 'reconcile',
+            'status': (
+              'already_in_progress'
+              if (__ca_password_change_in_process | bool and not cyberark_reconcile_force | bool)
+              else 'submitted'
+            ),
+            'safe': __ca_safe,
+            'username': __ca_username,
+            'account_id': __ca_account_id,
+            'password_fact': __ca_password_fact,
+            'changed': (
+              false
+              if (__ca_password_change_in_process | bool and not cyberark_reconcile_force | bool)
+              else true
+            )
+          }
+        }, recursive=True)
+      }}
+meta/main.yml
+---
+galaxy_info:
+  role_name: cyberark_cert_password
+  author: your_team
+  description: Retrieve and reconcile CyberArk passwords using client certificate authentication.
+  min_ansible_version: "2.9"
+  license: internal
+  platforms:
+    - name: EL
+      versions:
+        - all
+    - name: AIX
+      versions:
+        - all
+
+collections:
+  - cyberark.pas
+Example: retrieve
+---
+- name: Retrieve CyberArk passwords
+  hosts: app_servers
+  gather_facts: false
+
+  vars:
+    mode: retrieve
+
+    cyberark_ccp_api_base_url: "https://ccp.example.com"
+    cyberark_app_id: "Ansible_AppID"
+    cyberark_safe: "APP_SAFE"
+
+    was_user: "wasadmin"
+    mq_user: "mqm"
+
+    cyberark_user_vars:
+      - was_user
+      - mq_user
+
+  roles:
+    - cyberark_cert_password
+
+  tasks:
+    - name: Use password facts in another role/task
+      debug:
+        msg:
+          - "was_password is set"
+          - "mq_password is set"
+      no_log: true
+
+This sets:
+
+was_password: "<CyberArk password for wasadmin>"
+mq_password: "<CyberArk password for mqm>"
+Example: reconcile with cert auth
+---
+- name: Reconcile CyberArk passwords with cert-based auth
+  hosts: app_servers
+  gather_facts: false
+
+  vars:
+    mode: reconcile
+
+    cyberark_ccp_api_base_url: "https://ccp.example.com"
+    cyberark_pvwa_base_url: "https://pvwa.example.com"
+    cyberark_app_id: "Ansible_AppID"
+    cyberark_safe: "APP_SAFE"
+
+    was_user: "wasadmin"
+    mq_user: "mqm"
+
+    cyberark_user_vars:
+      - was_user
+      - mq_user
+
+    cyberark_retrieve_after_reconcile: true
+    cyberark_reconcile_retries: 30
+    cyberark_reconcile_delay: 20
+
+  roles:
+    - cyberark_cert_password
+Advanced reconcile input with account ID
+
+This is the most reliable for reconcile because the CyberArk reconcile API requires the account ID.
+
+cyberark_accounts:
+  - name: was
+    username: "{{ was_user }}"
+    safe: "APP_SAFE"
+    account_id: "12_34"
+    password_fact: "was_password"
+
+  - name: mq
+    username: "{{ mq_user }}"
+    safe: "MQ_SAFE"
+    account_id: "56_78"
+    password_fact: "mq_password"
+Idempotency note
+
+Retrieve mode is fully idempotent: it only reads from CyberArk and uses changed_when: false.
+
+Reconcile is an action in CyberArk. This role prevents duplicate reconcile submission while PasswordChangeInProcess is already true. After CyberArk finishes, another mode: reconcile run is a new reconcile request by definition, so it will submit again unless you control it with your workflow or provide a change/request gate. CyberArk’s reconcile endpoint marks an account for automatic reconciliation by CPM, so repeated calls are repeated management actions.
