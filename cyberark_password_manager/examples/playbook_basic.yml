@@ -1,0 +1,35 @@
+---
+# Example playbook: Basic password retrieval from CyberArk
+# This example shows how to retrieve passwords for multiple users
+
+- name: Retrieve passwords from CyberArk
+  hosts: localhost
+  gather_facts: false
+  
+  vars:
+    # CyberArk connection details
+    cyberark_api_base_url: "https://cyberark.example.com"
+    cyberark_client_cert: "/etc/ansible/certs/client.crt"
+    cyberark_client_key: "/etc/ansible/certs/client.key"
+    cyberark_safe_name: "ANSIBLE_SAFE"
+    cyberark_app_id: "AnsibleAutomation"
+    
+    # Define user accounts - Simple format!
+    # Just specify: variable_name_user: username_in_cyberark
+    was_user: wasadmin
+    mq_user: mqm
+    db_user: dbadmin
+
+  roles:
+    - cyberark_password_manager
+
+  post_tasks:
+    - name: Verify passwords were retrieved
+      ansible.builtin.debug:
+        msg: "Successfully retrieved passwords for: was_user, mq_user, db_user"
+      # Password facts are now available:
+      # - was_password (contains password for wasadmin)
+      # - mq_password (contains password for mqm)
+      # - db_password (contains password for dbadmin)
+
+# Made with Bob

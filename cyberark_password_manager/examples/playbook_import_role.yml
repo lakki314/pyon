@@ -1,0 +1,87 @@
+---
+# Example playbook: Using the role in multiple plays with import_role
+# This demonstrates how to use the role in different contexts
+
+- name: Configure WebSphere Application Server
+  hosts: websphere_servers
+  gather_facts: false
+  
+  tasks:
+    - name: Retrieve WebSphere admin password from CyberArk
+      ansible.builtin.import_role:
+        name: cyberark_password_manager
+      vars:
+        cyberark_api_base_url: "https://cyberark.example.com"
+        cyberark_client_cert: "/etc/ansible/certs/client.crt"
+        cyberark_client_key: "/etc/ansible/certs/client.key"
+        cyberark_safe_name: "WAS_SAFE"
+        cyberark_app_id: "WAS_APP"
+        was_user: wasadmin
+      delegate_to: localhost
+      run_once: true
+
+    - name: Update WebSphere configuration
+      ansible.builtin.shell:
+        cmd: "/opt/IBM/WebSphere/bin/wsadmin.sh -user {{ was_user }} -password {{ was_password }} -c 'print AdminConfig.list()'"
+      no_log: true
+      register: was_config
+
+    - name: Display configuration (sanitized)
+      ansible.builtin.debug:
+        msg: "WebSphere configuration updated successfully"
+
+- name: Configure IBM MQ
+  hosts: mq_servers
+  gather_facts: false
+  
+  tasks:
+    - name: Retrieve MQ admin password from CyberArk
+      ansible.builtin.import_role:
+        name: cyberark_password_manager
+      vars:
+        cyberark_api_base_url: "https://cyberark.example.com"
+        cyberark_client_cert: "/etc/ansible/certs/client.crt"
+        cyberark_client_key: "/etc/ansible/certs/client.key"
+        cyberark_safe_name: "MQ_SAFE"
+        cyberark_app_id: "MQ_APP"
+        mq_user: mqm
+      delegate_to: localhost
+      run_once: true
+
+    - name: Set MQ database credentials
+      ansible.builtin.shell:
+        cmd: "mqsisetdbparms -n jdbc::mydb -u {{ mq_user }} -p {{ mq_password }}"
+      no_log: true
+
+    - name: Verify MQ configuration
+      ansible.builtin.debug:
+        msg: "MQ credentials updated successfully"
+
+- name: Configure Database
+  hosts: database_servers
+  gather_facts: false
+  
+  tasks:
+    - name: Retrieve database admin password from CyberArk
+      ansible.builtin.import_role:
+        name: cyberark_password_manager
+      vars:
+        cyberark_api_base_url: "https://cyberark.example.com"
+        cyberark_client_cert: "/etc/ansible/certs/client.crt"
+        cyberark_client_key: "/etc/ansible/certs/client.key"
+        cyberark_safe_name: "DB_SAFE"
+        cyberark_app_id: "DB_APP"
+        db_user: dbadmin
+        db_app_user: appuser
+      delegate_to: localhost
+      run_once: true
+
+    - name: Update database connection
+      ansible.builtin.postgresql_user:
+        name: "{{ db_app_user }}"
+        password: "{{ db_app_password }}"
+        login_user: "{{ db_user }}"
+        login_password: "{{ db_password }}"
+      no_log: true
+
+# Made with Bob

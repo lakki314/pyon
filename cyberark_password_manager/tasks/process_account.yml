@@ -1,0 +1,102 @@
+---
+# Process individual CyberArk account
+
+- name: Set account variables from user_var
+  ansible.builtin.set_fact:
+    _account_user_var: "{{ user_var_name }}"
+    _account_username: "{{ vars[user_var_name] }}"
+    _password_var_name: "{{ user_var_name | regex_replace('_user$', '_password') }}"
+    _account_config: "{{ cyberark_account_config.get(user_var_name, {}) }}"
+
+- name: Set account query and reconcile settings
+  ansible.builtin.set_fact:
+    _account_object_query: "{{ _account_config.get('object_query', 'Safe=' + cyberark_safe_name + ';UserName=' + _account_username) }}"
+    _account_reconcile: "{{ _account_config.get('reconcile', false) }}"
+
+- name: Display account being processed
+  ansible.builtin.debug:
+    msg: "Processing CyberArk account: {{ _account_username }} ({{ _account_user_var }} -> {{ _password_var_name }})"
+  when: ansible_verbosity >= 1
+
+- name: Check if password already retrieved (idempotency check)
+  ansible.builtin.set_fact:
+    _password_already_set: "{{ _password_var_name in vars and vars[_password_var_name] is defined and vars[_password_var_name] | length > 0 }}"
+
+- name: Retrieve password from CyberArk
+  cyberark.pas.cyberark_credential:
+    api_base_url: "{{ cyberark_api_base_url }}"
+    app_id: "{{ cyberark_app_id }}"
+    query: "{{ _account_object_query }}"
+    client_cert: "{{ cyberark_client_cert }}"
+    client_key: "{{ cyberark_client_key }}"
+    validate_certs: "{{ cyberark_validate_certs }}"
+    connection_timeout: "{{ cyberark_connection_timeout }}"
+    reason: "{{ cyberark_reason }}"
+  register: _cyberark_result
+  no_log: true
+  when: not _password_already_set
+  failed_when:
+    - _cyberark_result is failed
+    - cyberark_fail_on_error | bool
+
+- name: Store retrieved password in temporary dictionary
+  ansible.builtin.set_fact:
+    _cyberark_retrieved_passwords: >-
+      {{
+        _cyberark_retrieved_passwords | combine({
+          _password_var_name: _cyberark_result.result.Content
+        })
+      }}
+  no_log: true
+  when:
+    - not _password_already_set
+    - _cyberark_result is succeeded
+    - _cyberark_result.result is defined
+    - _cyberark_result.result.Content is defined
+
+- name: Reconcile password in CyberArk (if requested)
+  cyberark.pas.cyberark_account:
+    api_base_url: "{{ cyberark_api_base_url }}"
+    app_id: "{{ cyberark_app_id }}"
+    query: "{{ _account_object_query }}"
+    client_cert: "{{ cyberark_client_cert }}"
+    client_key: "{{ cyberark_client_key }}"
+    validate_certs: "{{ cyberark_validate_certs }}"
+    connection_timeout: "{{ cyberark_connection_timeout }}"
+    reason: "{{ cyberark_reason }} - Reconcile"
+    state: reconcile
+  register: _cyberark_reconcile_result
+  no_log: true
+  when:
+    - _account_reconcile | bool
+    - not _password_already_set
+    - _cyberark_result is succeeded
+  failed_when:
+    - _cyberark_reconcile_result is failed
+    - cyberark_fail_on_error | bool
+
+- name: Update password after reconciliation
+  ansible.builtin.set_fact:
+    _cyberark_retrieved_passwords: >-
+      {{
+        _cyberark_retrieved_passwords | combine({
+          _password_var_name: _cyberark_reconcile_result.result.Content
+        })
+      }}
+  no_log: true
+  when:
+    - _account_reconcile | bool
+    - not _password_already_set
+    - _cyberark_reconcile_result is succeeded
+    - _cyberark_reconcile_result.result is defined
+    - _cyberark_reconcile_result.result.Content is defined
+
+- name: Verify password was retrieved
+  ansible.builtin.assert:
+    that:
+      - _password_var_name in _cyberark_retrieved_passwords or _password_already_set
+    fail_msg: "Failed to retrieve password for {{ _account_username }}"
+    success_msg: "Password successfully retrieved for {{ _account_username }}"
+  when: cyberark_fail_on_error | bool
+
+# Made with Bob

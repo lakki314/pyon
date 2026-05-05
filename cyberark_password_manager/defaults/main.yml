@@ -1,0 +1,40 @@
+---
+# CyberArk API Configuration
+cyberark_api_base_url: "https://cyberark.example.com"
+cyberark_validate_certs: true
+cyberark_client_cert: ""  # Path to client certificate file
+cyberark_client_key: ""   # Path to client key file
+
+# CyberArk Safe Configuration
+cyberark_safe_name: ""
+cyberark_app_id: ""
+
+# Password Management Configuration
+cyberark_fail_on_error: true
+cyberark_connection_timeout: 30
+cyberark_reason: "Automated password retrieval via Ansible"
+
+# User accounts to manage - Simple format
+# Just define variables like: was_user: wasadmin, mq_user: mqm
+# The role will automatically create corresponding password facts: was_password, mq_password
+#
+# Example usage in playbook:
+# vars:
+#   was_user: wasadmin
+#   mq_user: mqm
+#   db_user: dbadmin
+
+# Advanced configuration (optional)
+# Override default behavior for specific accounts
+cyberark_account_config: {}
+# Example:
+# cyberark_account_config:
+#   was_user:
+#     object_query: "Safe=MY_SAFE;Folder=Root;Object=wasadmin-prod"
+#     reconcile: true
+#   mq_user:
+#     reconcile: true
+
+# Internal variables (do not modify)
+_cyberark_retrieved_passwords: {}
+_cyberark_user_vars: []

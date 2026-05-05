@@ -1,0 +1,37 @@
+---
+# Example playbook: Retrieve and reconcile passwords from CyberArk
+# This example shows how to reconcile passwords (trigger password change)
+
+- name: Retrieve and reconcile passwords from CyberArk
+  hosts: localhost
+  gather_facts: false
+  
+  vars:
+    # CyberArk connection details
+    cyberark_api_base_url: "https://cyberark.example.com"
+    cyberark_client_cert: "/etc/ansible/certs/client.crt"
+    cyberark_client_key: "/etc/ansible/certs/client.key"
+    cyberark_safe_name: "PROD_SAFE"
+    cyberark_app_id: "AnsibleProd"
+    cyberark_reason: "Scheduled password rotation via Ansible"
+    
+    # Define user accounts
+    was_user: wasadmin
+    mq_user: mqm
+    
+    # Configure reconciliation for specific accounts
+    cyberark_account_config:
+      was_user:
+        reconcile: true  # This will trigger password reconciliation
+      mq_user:
+        reconcile: true
+
+  roles:
+    - cyberark_password_manager
+
+  post_tasks:
+    - name: Verify passwords were reconciled
+      ansible.builtin.debug:
+        msg: "Successfully reconciled passwords for: was_user, mq_user"
+
+# Made with Bob

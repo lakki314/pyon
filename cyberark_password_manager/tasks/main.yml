@@ -1,0 +1,62 @@
+---
+# Main tasks file for cyberark_password_manager role
+
+- name: Validate required variables
+  ansible.builtin.assert:
+    that:
+      - cyberark_api_base_url is defined
+      - cyberark_api_base_url | length > 0
+      - cyberark_client_cert is defined
+      - cyberark_client_cert | length > 0
+      - cyberark_client_key is defined
+      - cyberark_client_key | length > 0
+      - cyberark_safe_name is defined
+      - cyberark_safe_name | length > 0
+      - cyberark_app_id is defined
+      - cyberark_app_id | length > 0
+    fail_msg: "Required CyberArk configuration variables are missing"
+    quiet: true
+
+- name: Verify client certificate exists
+  ansible.builtin.stat:
+    path: "{{ cyberark_client_cert }}"
+  register: _cert_check
+  failed_when: not _cert_check.stat.exists
+  changed_when: false
+
+- name: Verify client key exists
+  ansible.builtin.stat:
+    path: "{{ cyberark_client_key }}"
+  register: _key_check
+  failed_when: not _key_check.stat.exists
+  changed_when: false
+
+- name: Discover user variables ending with _user
+  ansible.builtin.set_fact:
+    _cyberark_user_vars: "{{ vars.keys() | select('match', '.*_user$') | list }}"
+
+- name: Validate at least one user variable is defined
+  ansible.builtin.assert:
+    that:
+      - _cyberark_user_vars | length > 0
+    fail_msg: "No user variables found. Please define variables ending with '_user' (e.g., was_user: wasadmin)"
+    quiet: true
+
+- name: Initialize password facts dictionary
+  ansible.builtin.set_fact:
+    _cyberark_retrieved_passwords: {}
+
+- name: Process each CyberArk account
+  ansible.builtin.include_tasks: process_account.yml
+  loop: "{{ _cyberark_user_vars }}"
+  loop_control:
+    loop_var: user_var_name
+    label: "{{ user_var_name }}"
+
+- name: Set password facts for each account
+  ansible.builtin.set_fact:
+    "{{ item.key }}": "{{ item.value }}"
+  loop: "{{ _cyberark_retrieved_passwords | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  no_log: true

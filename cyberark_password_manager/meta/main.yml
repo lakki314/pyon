@@ -1,0 +1,27 @@
+---
+galaxy_info:
+  author: Ansible Administrator
+  description: Ansible role to retrieve and reconcile passwords from CyberArk using certificate-based authentication
+  company: Your Company
+  license: MIT
+  min_ansible_version: "2.9"
+  platforms:
+    - name: EL
+      versions:
+        - 7
+        - 8
+        - 9
+    - name: Ubuntu
+      versions:
+        - bionic
+        - focal
+        - jammy
+  galaxy_tags:
+    - cyberark
+    - password
+    - security
+    - vault
+
+dependencies: []
+
+# Made with Bob
