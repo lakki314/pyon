@@ -22,7 +22,7 @@
   ansible.builtin.set_fact:
     _password_already_set: "{{ _password_var_name in vars and vars[_password_var_name] is defined and vars[_password_var_name] | length > 0 }}"
 
-- name: Retrieve password from CyberArk using session
+- name: Retrieve current password from CyberArk using session
   cyberark.pas.cyberark_credential:
     api_base_url: "{{ cyberark_api_base_url }}"
     cyberark_session: "{{ _cyberark_session }}"
@@ -37,7 +37,18 @@
     - _cyberark_result is failed
     - cyberark_fail_on_error | bool
 
-- name: Store retrieved password in temporary dictionary
+- name: Store current password for comparison (if reconcile requested)
+  ansible.builtin.set_fact:
+    _old_password: "{{ _cyberark_result.result.Content }}"
+  no_log: true
+  when:
+    - _account_reconcile | bool
+    - not _password_already_set
+    - _cyberark_result is succeeded
+    - _cyberark_result.result is defined
+    - _cyberark_result.result.Content is defined
+
+- name: Store retrieved password in temporary dictionary (if not reconciling)
   ansible.builtin.set_fact:
     _cyberark_retrieved_passwords: >-
       {{
@@ -47,6 +58,7 @@
       }}
   no_log: true
   when:
+    - not _account_reconcile | bool
     - not _password_already_set
     - _cyberark_result is succeeded
     - _cyberark_result.result is defined
@@ -71,21 +83,54 @@
     - _cyberark_reconcile_result is failed
     - cyberark_fail_on_error | bool
 
-- name: Update password after reconciliation
+- name: Retrieve new password after reconciliation
+  cyberark.pas.cyberark_credential:
+    api_base_url: "{{ cyberark_api_base_url }}"
+    cyberark_session: "{{ _cyberark_session }}"
+    query: "{{ _account_object_query }}"
+    validate_certs: "{{ cyberark_validate_certs }}"
+    connection_timeout: "{{ cyberark_connection_timeout }}"
+    reason: "{{ cyberark_reason }} - Post-Reconcile Retrieval"
+  register: _cyberark_new_password_result
+  no_log: true
+  when:
+    - _account_reconcile | bool
+    - not _password_already_set
+    - _cyberark_reconcile_result is succeeded
+  failed_when:
+    - _cyberark_new_password_result is failed
+    - cyberark_fail_on_error | bool
+
+- name: Verify password was changed during reconciliation
+  ansible.builtin.assert:
+    that:
+      - _old_password != _cyberark_new_password_result.result.Content
+    fail_msg: "Password reconciliation failed: Password did not change for {{ _account_username }}"
+    success_msg: "Password successfully reconciled and changed for {{ _account_username }}"
+  no_log: true
+  when:
+    - _account_reconcile | bool
+    - not _password_already_set
+    - _cyberark_new_password_result is succeeded
+    - _cyberark_new_password_result.result is defined
+    - _cyberark_new_password_result.result.Content is defined
+    - cyberark_fail_on_error | bool
+
+- name: Store new password after reconciliation
   ansible.builtin.set_fact:
     _cyberark_retrieved_passwords: >-
       {{
         _cyberark_retrieved_passwords | combine({
-          _password_var_name: _cyberark_reconcile_result.result.Content
+          _password_var_name: _cyberark_new_password_result.result.Content
         })
       }}
   no_log: true
   when:
     - _account_reconcile | bool
     - not _password_already_set
-    - _cyberark_reconcile_result is succeeded
-    - _cyberark_reconcile_result.result is defined
-    - _cyberark_reconcile_result.result.Content is defined
+    - _cyberark_new_password_result is succeeded
+    - _cyberark_new_password_result.result is defined
+    - _cyberark_new_password_result.result.Content is defined
 
 - name: Verify password was retrieved
   ansible.builtin.assert:
