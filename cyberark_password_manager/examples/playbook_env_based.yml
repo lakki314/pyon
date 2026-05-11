@@ -1,0 +1,70 @@
+---
+# Example playbook: Using environment-based configuration
+# This example shows how to use cyberark_env to automatically select intg or prod configuration
+
+- name: Retrieve passwords from CyberArk Integration Environment
+  hosts: localhost
+  gather_facts: false
+  
+  vars:
+    # Simply specify the environment - all configuration is automatic!
+    cyberark_env: intg  # Options: intg, prod
+    
+    # Define user accounts
+    was_user: wasadmin
+    mq_user: mqm
+    db_user: dbadmin
+
+  roles:
+    - cyberark_password_manager
+
+  post_tasks:
+    - name: Verify passwords were retrieved from INTG
+      ansible.builtin.debug:
+        msg: "Successfully retrieved passwords from Integration environment"
+
+---
+# Example: Production environment
+- name: Retrieve passwords from CyberArk Production Environment
+  hosts: localhost
+  gather_facts: false
+  
+  vars:
+    # Switch to production by changing one variable!
+    cyberark_env: prod
+    
+    # Same user accounts work across environments
+    was_user: wasadmin
+    mq_user: mqm
+
+  roles:
+    - cyberark_password_manager
+
+  post_tasks:
+    - name: Verify passwords were retrieved from PROD
+      ansible.builtin.debug:
+        msg: "Successfully retrieved passwords from Production environment"
+
+---
+# Example: Environment from inventory or extra vars
+- name: Retrieve passwords using dynamic environment selection
+  hosts: localhost
+  gather_facts: false
+  
+  vars:
+    # Environment can be passed via command line:
+    # ansible-playbook playbook.yml -e "cyberark_env=intg"
+    # Or defined in inventory/group_vars
+    
+    was_user: wasadmin
+    mq_user: mqm
+
+  roles:
+    - cyberark_password_manager
+
+  post_tasks:
+    - name: Display environment used
+      ansible.builtin.debug:
+        msg: "Retrieved passwords from {{ cyberark_env }} environment"
+
+# Made with Bob

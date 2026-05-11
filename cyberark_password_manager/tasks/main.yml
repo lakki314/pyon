@@ -1,6 +1,26 @@
 ---
 # Main tasks file for cyberark_password_manager role
 
+- name: Set environment-based configuration if cyberark_env is specified
+  ansible.builtin.set_fact:
+    cyberark_api_base_url: "{{ cyberark_environments[cyberark_env].api_base_url }}"
+    cyberark_client_cert: "{{ cyberark_environments[cyberark_env].client_cert }}"
+    cyberark_client_key: "{{ cyberark_environments[cyberark_env].client_key }}"
+    cyberark_safe_name: "{{ cyberark_environments[cyberark_env].safe_name }}"
+  when:
+    - cyberark_env is defined
+    - cyberark_env | length > 0
+    - cyberark_env in cyberark_environments
+
+- name: Validate cyberark_env if specified
+  ansible.builtin.assert:
+    that:
+      - cyberark_env in cyberark_environments
+    fail_msg: "Invalid cyberark_env '{{ cyberark_env }}'. Valid options: {{ cyberark_environments.keys() | list | join(', ') }}"
+  when:
+    - cyberark_env is defined
+    - cyberark_env | length > 0
+
 - name: Validate required variables
   ansible.builtin.assert:
     that:
@@ -12,9 +32,7 @@
       - cyberark_client_key | length > 0
       - cyberark_safe_name is defined
       - cyberark_safe_name | length > 0
-      - cyberark_app_id is defined
-      - cyberark_app_id | length > 0
-    fail_msg: "Required CyberArk configuration variables are missing"
+    fail_msg: "Required CyberArk configuration variables are missing. Either set cyberark_env or provide manual configuration."
     quiet: true
 
 - name: Verify client certificate exists
@@ -30,6 +48,15 @@
   register: _key_check
   failed_when: not _key_check.stat.exists
   changed_when: false
+
+- name: Create CyberArk session using certificate authentication
+  cyberark.pas.cyberark_authentication:
+    api_base_url: "{{ cyberark_api_base_url }}"
+    client_cert: "{{ cyberark_client_cert }}"
+    client_key: "{{ cyberark_client_key }}"
+    validate_certs: "{{ cyberark_validate_certs }}"
+  register: _cyberark_session
+  no_log: true
 
 - name: Discover user variables ending with _user
   ansible.builtin.set_fact:
@@ -60,3 +87,12 @@
   loop_control:
     label: "{{ item.key }}"
   no_log: true
+
+- name: Logoff from CyberArk session
+  cyberark.pas.cyberark_authentication:
+    api_base_url: "{{ cyberark_api_base_url }}"
+    cyberark_session: "{{ _cyberark_session }}"
+    validate_certs: "{{ cyberark_validate_certs }}"
+    state: absent
+  no_log: true
+  when: _cyberark_session is defined

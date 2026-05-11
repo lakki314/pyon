@@ -1,15 +1,30 @@
 ---
-# CyberArk API Configuration
+# CyberArk Environment Selection
+# Set this to 'intg' or 'prod' to automatically use the corresponding configuration
+cyberark_env: ""  # Options: intg, prod (leave empty to use manual configuration)
+
+# Environment-specific configurations
+cyberark_environments:
+  intg:
+    api_base_url: "https://cyberark-intg.example.com"
+    client_cert: "/etc/ansible/certs/intg/client.crt"
+    client_key: "/etc/ansible/certs/intg/client.key"
+    safe_name: "INTG_SAFE"
+  prod:
+    api_base_url: "https://cyberark-prod.example.com"
+    client_cert: "/etc/ansible/certs/prod/client.crt"
+    client_key: "/etc/ansible/certs/prod/client.key"
+    safe_name: "PROD_SAFE"
+
+# Manual Configuration (used when cyberark_env is not set)
+# These will be overridden if cyberark_env is specified
 cyberark_api_base_url: "https://cyberark.example.com"
-cyberark_validate_certs: true
-cyberark_client_cert: ""  # Path to client certificate file
-cyberark_client_key: ""   # Path to client key file
-
-# CyberArk Safe Configuration
+cyberark_client_cert: ""  # Path to client certificate file for session authentication
+cyberark_client_key: ""   # Path to client key file for session authentication
 cyberark_safe_name: ""
-cyberark_app_id: ""
 
-# Password Management Configuration
+# Common Configuration
+cyberark_validate_certs: true
 cyberark_fail_on_error: true
 cyberark_connection_timeout: 30
 cyberark_reason: "Automated password retrieval via Ansible"

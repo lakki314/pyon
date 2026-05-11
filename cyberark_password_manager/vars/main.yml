@@ -2,4 +2,18 @@
 # vars file for cyberark_password_manager
 # Variables in this file have higher precedence than defaults
 
+# You can override environment configurations here if needed
+# Example:
+# cyberark_environments:
+#   intg:
+#     api_base_url: "https://custom-intg-url.example.com"
+#     client_cert: "/custom/path/intg/client.crt"
+#     client_key: "/custom/path/intg/client.key"
+#     safe_name: "CUSTOM_INTG_SAFE"
+#   prod:
+#     api_base_url: "https://custom-prod-url.example.com"
+#     client_cert: "/custom/path/prod/client.crt"
+#     client_key: "/custom/path/prod/client.key"
+#     safe_name: "CUSTOM_PROD_SAFE"
+
 # Made with Bob

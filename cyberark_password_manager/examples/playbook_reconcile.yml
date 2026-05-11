@@ -1,6 +1,6 @@
 ---
 # Example playbook: Retrieve and reconcile passwords from CyberArk
-# This example shows how to reconcile passwords (trigger password change)
+# This example shows how to reconcile passwords (trigger password change) using session-based authentication
 
 - name: Retrieve and reconcile passwords from CyberArk
   hosts: localhost
@@ -12,7 +12,6 @@
     cyberark_client_cert: "/etc/ansible/certs/client.crt"
     cyberark_client_key: "/etc/ansible/certs/client.key"
     cyberark_safe_name: "PROD_SAFE"
-    cyberark_app_id: "AnsibleProd"
     cyberark_reason: "Scheduled password rotation via Ansible"
     
     # Define user accounts

@@ -15,7 +15,6 @@
         cyberark_client_cert: "/etc/ansible/certs/client.crt"
         cyberark_client_key: "/etc/ansible/certs/client.key"
         cyberark_safe_name: "WAS_SAFE"
-        cyberark_app_id: "WAS_APP"
         was_user: wasadmin
       delegate_to: localhost
       run_once: true
@@ -43,7 +42,6 @@
         cyberark_client_cert: "/etc/ansible/certs/client.crt"
         cyberark_client_key: "/etc/ansible/certs/client.key"
         cyberark_safe_name: "MQ_SAFE"
-        cyberark_app_id: "MQ_APP"
         mq_user: mqm
       delegate_to: localhost
       run_once: true
@@ -70,7 +68,6 @@
         cyberark_client_cert: "/etc/ansible/certs/client.crt"
         cyberark_client_key: "/etc/ansible/certs/client.key"
         cyberark_safe_name: "DB_SAFE"
-        cyberark_app_id: "DB_APP"
         db_user: dbadmin
         db_app_user: appuser
       delegate_to: localhost

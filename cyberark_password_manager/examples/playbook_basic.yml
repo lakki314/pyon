@@ -1,6 +1,6 @@
 ---
 # Example playbook: Basic password retrieval from CyberArk
-# This example shows how to retrieve passwords for multiple users
+# This example shows how to retrieve passwords for multiple users using session-based authentication
 
 - name: Retrieve passwords from CyberArk
   hosts: localhost
@@ -12,7 +12,6 @@
     cyberark_client_cert: "/etc/ansible/certs/client.crt"
     cyberark_client_key: "/etc/ansible/certs/client.key"
     cyberark_safe_name: "ANSIBLE_SAFE"
-    cyberark_app_id: "AnsibleAutomation"
     
     # Define user accounts - Simple format!
     # Just specify: variable_name_user: username_in_cyberark

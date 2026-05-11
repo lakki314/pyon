@@ -12,19 +12,76 @@
    cp -r cyberark_password_manager /path/to/ansible/roles/
    ```
 
-## Quick Start
+## Quick Start - Environment-Based (Recommended)
 
 ### Step 1: Prepare Your Certificates
 
-Ensure you have your CyberArk client certificate and key files:
+Organize certificates by environment:
 ```bash
-/etc/ansible/certs/client.crt
-/etc/ansible/certs/client.key
+/etc/ansible/certs/intg/client.crt
+/etc/ansible/certs/intg/client.key
+/etc/ansible/certs/prod/client.crt
+/etc/ansible/certs/prod/client.key
 ```
 
-### Step 2: Create a Simple Playbook
+### Step 2: Configure Environments (Optional)
+
+The role comes with default environment configurations. To customize, edit `defaults/main.yml`:
+
+```yaml
+cyberark_environments:
+  intg:
+    api_base_url: "https://cyberark-intg.example.com"
+    client_cert: "/etc/ansible/certs/intg/client.crt"
+    client_key: "/etc/ansible/certs/intg/client.key"
+    safe_name: "INTG_SAFE"
+  prod:
+    api_base_url: "https://cyberark-prod.example.com"
+    client_cert: "/etc/ansible/certs/prod/client.crt"
+    client_key: "/etc/ansible/certs/prod/client.key"
+    safe_name: "PROD_SAFE"
+```
+
+### Step 3: Create a Simple Playbook
 
 Create `retrieve_passwords.yml`:
+
+```yaml
+---
+- name: Retrieve passwords from CyberArk
+  hosts: localhost
+  gather_facts: false
+  
+  vars:
+    # Just specify the environment!
+    cyberark_env: intg  # or 'prod'
+    
+    # Define your users
+    was_user: wasadmin
+    mq_user: mqm
+
+  roles:
+    - cyberark_password_manager
+
+  post_tasks:
+    - name: Confirm passwords retrieved
+      ansible.builtin.debug:
+        msg: "Passwords retrieved successfully from {{ cyberark_env }}"
+```
+
+### Step 4: Run the Playbook
+
+```bash
+# For integration environment
+ansible-playbook retrieve_passwords.yml
+
+# For production environment (override via command line)
+ansible-playbook retrieve_passwords.yml -e "cyberark_env=prod"
+```
+
+## Alternative: Manual Configuration
+
+If you prefer not to use environment-based configuration:
 
 ```yaml
 ---
@@ -37,26 +94,23 @@ Create `retrieve_passwords.yml`:
     cyberark_client_cert: "/etc/ansible/certs/client.crt"
     cyberark_client_key: "/etc/ansible/certs/client.key"
     cyberark_safe_name: "MY_SAFE"
-    cyberark_app_id: "AnsibleApp"
     
-    # Simply define your users - that's it!
     was_user: wasadmin
     mq_user: mqm
 
   roles:
     - cyberark_password_manager
-
-  post_tasks:
-    - name: Confirm passwords retrieved
-      ansible.builtin.debug:
-        msg: "Passwords retrieved successfully"
 ```
 
-### Step 3: Run the Playbook
+## How Session-Based Authentication Works
 
-```bash
-ansible-playbook retrieve_passwords.yml
-```
+The role uses a secure session-based approach:
+
+1. **Session Creation**: Creates a CyberArk session using your client certificate
+2. **Password Operations**: All retrieve/reconcile operations use this session
+3. **Automatic Cleanup**: Session is automatically terminated when role completes
+
+This is more secure and efficient than passing certificates to each operation.
 
 ## Variable Naming Convention
 
@@ -73,10 +127,25 @@ The role automatically creates password facts based on your `*_user` variable na
 
 ## Common Use Cases
 
-### Use Case 1: Retrieve Multiple Passwords
+### Use Case 1: Switch Between Environments
+
+```yaml
+# Integration
+vars:
+  cyberark_env: intg
+  was_user: wasadmin
+
+# Production (just change one variable!)
+vars:
+  cyberark_env: prod
+  was_user: wasadmin
+```
+
+### Use Case 2: Retrieve Multiple Passwords
 
 ```yaml
 vars:
+  cyberark_env: intg
   was_user: wasadmin
   mq_user: mqm
   db_user: dbadmin
@@ -87,10 +156,11 @@ After running, you'll have these facts available:
 - `mq_password`
 - `db_password`
 
-### Use Case 2: Reconcile (Rotate) Passwords
+### Use Case 3: Reconcile (Rotate) Passwords
 
 ```yaml
 vars:
+  cyberark_env: prod
   was_user: wasadmin
   mq_user: mqm
   
@@ -101,7 +171,7 @@ vars:
       reconcile: true
 ```
 
-### Use Case 3: Custom Object Query
+### Use Case 4: Custom Object Query
 
 ```yaml
 vars:
@@ -112,7 +182,7 @@ vars:
       object_query: "Safe=MY_SAFE;Folder=Root;Object=appuser-prod"
 ```
 
-### Use Case 4: Use in Other Roles
+### Use Case 5: Use in Other Roles
 
 ```yaml
 - name: Configure Application
@@ -122,11 +192,7 @@ vars:
       ansible.builtin.import_role:
         name: cyberark_password_manager
       vars:
-        cyberark_api_base_url: "https://cyberark.example.com"
-        cyberark_client_cert: "/etc/ansible/certs/client.crt"
-        cyberark_client_key: "/etc/ansible/certs/client.key"
-        cyberark_safe_name: "APP_SAFE"
-        cyberark_app_id: "AnsibleApp"
+        cyberark_env: prod  # Simple!
         app_user: appuser
       delegate_to: localhost
       run_once: true
@@ -145,6 +211,7 @@ vars:
 
 The role is idempotent:
 - ✅ Running multiple times won't retrieve passwords again if already set
+- ✅ Session is created once and reused for all operations
 - ✅ No unnecessary API calls to CyberArk
 - ✅ Safe to include in multiple plays
 
@@ -168,6 +235,11 @@ The role is idempotent:
    chmod 644 /etc/ansible/certs/client.crt
    ```
 
+4. **Session Security:**
+   - Sessions are automatically created and terminated
+   - No session tokens are exposed in logs
+   - All session operations use `no_log: true`
+
 ## Troubleshooting
 
 ### Problem: "No user variables found"
@@ -184,7 +256,6 @@ vars:
 - `cyberark_client_cert`
 - `cyberark_client_key`
 - `cyberark_safe_name`
-- `cyberark_app_id`
 
 ### Problem: Certificate not found
 **Solution:** Verify certificate paths:
@@ -193,17 +264,17 @@ ls -l /etc/ansible/certs/client.crt
 ls -l /etc/ansible/certs/client.key
 ```
 
+### Problem: Session creation failed
+**Solution:** Verify:
+1. Certificate is valid and not expired
+2. Certificate is authorized in CyberArk
+3. API URL is correct and accessible
+
 ### Problem: Connection timeout
 **Solution:** Increase timeout:
 ```yaml
 cyberark_connection_timeout: 60
 ```
-
-### Problem: Authentication failed
-**Solution:** Verify:
-1. Certificate is valid and not expired
-2. App ID is correctly configured in CyberArk
-3. Certificate is authorized for the application
 
 ## Advanced Configuration
 
@@ -246,7 +317,6 @@ cyberark_account_config:
     cyberark_client_cert: "/etc/ansible/certs/client.crt"
     cyberark_client_key: "/etc/ansible/certs/client.key"
     cyberark_safe_name: "ANSIBLE_SAFE"
-    cyberark_app_id: "AnsibleAutomation"
     cyberark_reason: "Automated deployment - Ticket #12345"
     
     # User Accounts (Simple Format)
@@ -267,8 +337,15 @@ cyberark_account_config:
   post_tasks:
     - name: Display success message
       ansible.builtin.debug:
-        msg: "All passwords retrieved successfully"
+        msg: "All passwords retrieved successfully via session-based authentication"
 ```
+
+## Session-Based Authentication Benefits
+
+✅ **More Secure**: Session tokens are managed internally, never exposed
+✅ **More Efficient**: Single session for all operations
+✅ **Automatic Cleanup**: Session is always terminated, even on errors
+✅ **Better Auditing**: Single login/logout event in CyberArk logs
 
 ## Examples Directory
 
