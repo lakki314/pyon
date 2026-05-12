@@ -1,0 +1,21 @@
+- name: Process all profile batches with guaranteed cleanup
+  block:
+    - name: Process each profile batch
+      include_tasks: restart_profile.yml
+      loop: "{{ profile_batch_list }}"
+      loop_control:
+        loop_var: profile_batch
+        label: "{{ inventory_hostname }} -> {{ profile_batch.profile_name }} -> {{ profile_batch.jvms | join(',') }}"
+      vars:
+        profile_dir: "{{ profile_batch.profile_dir }}"
+        profile_bin: "{{ profile_batch.profile_bin }}"
+        jvm_owner: "{{ profile_batch.jvm_owner }}"
+        profile_jvms: "{{ profile_batch.jvms | map('trim') | unique | list }}"
+        profile_name_for_ps: "{{ profile_batch.profile_name }}"
+        batch_sources: "{{ profile_batch.batch_sources | default([]) }}"
+        batch_source_summary: "{{ (profile_batch.batch_sources | default([])) | unique | join(',') }}"
+        source_map: "{{ source_map }}"
+  always:
+    - name: Cleanup banners (always)
+      when: (restart_banner_enabled | default(true)) | bool
+      include_tasks: banner_cleanup.yml
