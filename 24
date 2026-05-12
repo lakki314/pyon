@@ -1,0 +1,535 @@
+1) UPDATED roles/websphere_jvm_restart/tasks/discover_jvm.yml
+---
+# Inputs: jvm_name
+# Output appended to discovered_jvms:
+# { jvm_name, jvm_owner, profile_name, cell_name, profile_dir, profile_bin, discovery_source }
+
+- name: Initialize discovery vars
+  set_fact:
+    _ps_line: ""
+    _ps_lines: []
+    _profile_dir: ""
+    _profile_bin: ""
+    _profile_name: ""
+    _cell_name: ""
+    _jvm_owner: ""
+    _config_path: ""
+    discovered_profile_dir: ""
+    _discovery_source: ""
+  changed_when: false
+
+# --- PS lookup rules ---
+- name: PS lookup for dmgr
+  shell: "ps -ef | grep dmgr | grep -v grep"
+  register: _ps
+  changed_when: false
+  failed_when: false
+  when: (jvm_name | trim) == 'dmgr'
+
+- name: PS lookup for nodeagent
+  shell: "ps -ef | grep nodeagent | grep -v grep"
+  register: _ps
+  changed_when: false
+  failed_when: false
+  when: (jvm_name | trim) == 'nodeagent'
+
+- name: PS lookup for appserver
+  shell: "ps -ef | grep java | grep {{ (jvm_name | trim) | quote }} | grep -v grep"
+  register: _ps
+  changed_when: false
+  failed_when: false
+  when: (jvm_name | trim) not in ['dmgr','nodeagent']
+
+- name: Pick first ps line if any
+  set_fact:
+    _ps_lines: "{{ _ps.stdout_lines | default([]) }}"
+    _ps_line: "{{ (_ps.stdout_lines | default([]) | first | default('')) }}"
+  changed_when: false
+
+- name: If running, derive owner from ps
+  set_fact:
+    _jvm_owner: "{{ (_ps_line.split()[0] if (_ps_line | length > 0) else '') }}"
+  changed_when: false
+
+# --- Parse profile info from ps_words (last-4-words rule) ---
+- name: Parse profile info from ps_words (last-4-words rule)
+  set_fact:
+    _ps_words: "{{ _ps_line.split() }}"
+  changed_when: false
+
+- name: Derive profile_name/cell/config/profile_dir/profile_bin from ps_words
+  set_fact:
+    _config_path: "{{ _ps_words[-4] }}"
+    _cell_name: "{{ _ps_words[-3] }}"
+    _profile_name: "{{ _ps_words[-2] }}"
+    _profile_dir: "{{ (_ps_words[-4] | regex_replace('/config$', '')) }}"
+    _profile_bin: "{{ (_ps_words[-4] | regex_replace('/config$', '')) ~ '/bin' }}"
+  changed_when: false
+  when:
+    - _ps_line | length > 0
+    - _ps_words | length >= 4
+    - (_ps_words[-1] | trim) == (jvm_name | trim)
+
+# If ps_words parsing failed OR JVM not running, find profile on disk
+- name: Find profile for stopped JVM (filesystem search)
+  include_tasks: find_profile_for_stopped_jvm.yml
+  when: _profile_dir | length == 0
+  vars:
+    stopped_jvm_name: "{{ jvm_name | trim }}"
+
+- name: Finalize profile_dir/profile_bin/profile_name if from filesystem
+  set_fact:
+    _profile_dir: "{{ _profile_dir if (_profile_dir | length > 0) else discovered_profile_dir }}"
+    _profile_bin: "{{ _profile_bin if (_profile_bin | length > 0) else (discovered_profile_dir ~ '/bin') }}"
+    _profile_name: "{{ _profile_name if (_profile_name | length > 0) else (discovered_profile_dir | basename) }}"
+    _cell_name: "{{ _cell_name if (_cell_name | length > 0) else 'unknown' }}"
+    _jvm_owner: "{{ _jvm_owner if (_jvm_owner | length > 0) else cached_install_owner }}"
+  changed_when: false
+
+- name: Set discovery_source
+  set_fact:
+    _discovery_source: "{{ 'ps_words' if (_ps_line | length > 0 and _config_path | length > 0 and _profile_dir | length > 0) else 'filesystem_cache' }}"
+  changed_when: false
+
+- name: Validate discovered profile_dir/profile_bin/profile_name
+  assert:
+    that:
+      - _profile_dir | length > 0
+      - _profile_bin | length > 0
+      - _profile_name | length > 0
+    fail_msg: "Could not determine profile_dir/profile_bin/profile_name for JVM {{ jvm_name }} on {{ inventory_hostname }}."
+
+- name: Append discovered JVM (with discovery_source)
+  set_fact:
+    discovered_jvms: >-
+      {{
+        discovered_jvms + [
+          {
+            'jvm_name': (jvm_name | trim),
+            'jvm_owner': _jvm_owner,
+            'profile_name': _profile_name,
+            'cell_name': _cell_name,
+            'profile_dir': _profile_dir,
+            'profile_bin': _profile_bin,
+            'discovery_source': _discovery_source
+          }
+        ]
+      }}
+  changed_when: false
+
+- name: Debug - discovery result with source
+  when: wsjvm_debug | bool
+  debug:
+    msg:
+      jvm: "{{ jvm_name | trim }}"
+      source: "{{ _discovery_source }}"
+      owner: "{{ _jvm_owner }}"
+      profile_name: "{{ _profile_name }}"
+      cell_name: "{{ _cell_name }}"
+      profile_dir: "{{ _profile_dir }}"
+      profile_bin: "{{ _profile_bin }}"
+2) UPDATED roles/websphere_jvm_restart/tasks/execute_on_host.yml
+
+Adds:
+
+per-JVM source debug
+batch source summary (batch_sources, batch_source_summary)
+passes batch_source_summary and source_map down to restart_profile.yml
+---
+- name: Initialize per-host tracking
+  set_fact:
+    jvm_results: "{{ jvm_results | default([]) }}"
+    owners_touched: "{{ owners_touched | default([]) }}"
+    cached_install_root: "{{ cached_install_root | default('') }}"
+    cached_install_owner: "{{ cached_install_owner | default('') }}"
+    discovered_jvms: []
+    profile_batches: {}
+    source_map: {}
+  changed_when: false
+
+- name: Setup remote tmp for AIX-friendly operations
+  include_tasks: setup_remote_tmp.yml
+
+- name: Validate host_jvms exist
+  assert:
+    that:
+      - host_jvms is defined
+      - host_jvms | length > 0
+    fail_msg: "No host_jvms supplied on {{ inventory_hostname }}."
+
+# ---- Discover profile/owner per JVM ----
+- name: Discover each JVM (profile + owner)
+  include_tasks: discover_jvm.yml
+  loop: "{{ host_jvms | map('trim') | unique | list }}"
+  loop_control:
+    loop_var: jvm_name
+    label: "{{ inventory_hostname }} -> discover {{ jvm_name }}"
+
+- name: Debug - discovered JVMs with sources (per host)
+  when: wsjvm_debug | bool
+  debug:
+    msg:
+      jvm: "{{ item.jvm_name }}"
+      source: "{{ item.discovery_source }}"
+      owner: "{{ item.jvm_owner }}"
+      profile: "{{ item.profile_name }}"
+      profile_dir: "{{ item.profile_dir }}"
+  loop: "{{ discovered_jvms }}"
+  loop_control:
+    label: "{{ item.jvm_name }}"
+
+# Build a quick lookup map for record_one_jvm.yml
+- name: Build source_map (jvm_name -> discovery_source)
+  set_fact:
+    source_map: "{{ source_map | combine({ (item.jvm_name | trim): (item.discovery_source | default('unknown')) }) }}"
+  loop: "{{ discovered_jvms }}"
+  loop_control:
+    label: "{{ item.jvm_name }}"
+  changed_when: false
+
+# ---- Build profile_batches keyed by profile_bin + owner ----
+- name: Build profile batches (profile_bin+owner -> jvms)
+  set_fact:
+    profile_batches: >-
+      {{
+        profile_batches
+        | combine(
+            {
+              (item.profile_bin ~ '||' ~ item.jvm_owner): {
+                'profile_bin': item.profile_bin,
+                'profile_dir': item.profile_dir,
+                'profile_name': item.profile_name,
+                'jvm_owner': item.jvm_owner,
+                'jvms': ( (profile_batches.get(item.profile_bin ~ '||' ~ item.jvm_owner, {}).get('jvms', [])) + [ item.jvm_name ] )
+              }
+            },
+            recursive=True
+          )
+      }}
+  loop: "{{ discovered_jvms }}"
+  loop_control:
+    label: "{{ item.jvm_name }} -> {{ item.profile_name }}"
+
+- name: Convert profile_batches to list
+  set_fact:
+    profile_batch_list: "{{ profile_batches | dict2items | map(attribute='value') | list }}"
+
+# ---- Add batch_sources + summary for debug/passing ----
+- name: Enrich profile batches with batch_sources (ps_words/filesystem_cache)
+  set_fact:
+    profile_batch_list: >-
+      {{
+        profile_batch_list
+        | map('combine', {
+            'batch_sources': (
+              discovered_jvms
+              | selectattr('profile_bin', 'equalto', item.profile_bin)
+              | selectattr('jvm_owner', 'equalto', item.jvm_owner)
+              | map(attribute='discovery_source')
+              | list
+              | unique
+            )
+          })
+        | list
+      }}
+  vars:
+    item: "{{ item0 }}"
+  loop: "{{ profile_batch_list }}"
+  loop_control:
+    loop_var: item0
+  changed_when: false
+
+- name: Debug - profile batch sources
+  when: wsjvm_debug | bool
+  debug:
+    msg:
+      profile: "{{ item.profile_name }}"
+      profile_dir: "{{ item.profile_dir }}"
+      owner: "{{ item.jvm_owner }}"
+      jvms: "{{ item.jvms }}"
+      batch_sources: "{{ item.batch_sources | default([]) }}"
+  loop: "{{ profile_batch_list }}"
+  loop_control:
+    label: "{{ item.profile_name }}"
+
+# ---- Process each profile batch ----
+- name: Restart JVMs per profile batch
+  include_tasks: restart_profile.yml
+  loop: "{{ profile_batch_list }}"
+  loop_control:
+    loop_var: profile_batch
+    label: "{{ inventory_hostname }} -> {{ profile_batch.profile_name }} -> {{ profile_batch.jvms | join(',') }}"
+  vars:
+    profile_dir: "{{ profile_batch.profile_dir }}"
+    profile_bin: "{{ profile_batch.profile_bin }}"
+    jvm_owner: "{{ profile_batch.jvm_owner }}"
+    profile_jvms: "{{ profile_batch.jvms | map('trim') | unique | list }}"
+    profile_name_for_ps: "{{ profile_batch.profile_name }}"
+    batch_sources: "{{ profile_batch.batch_sources | default([]) }}"
+    batch_source_summary: "{{ (profile_batch.batch_sources | default([])) | unique | join(',') }}"
+    source_map: "{{ source_map }}"
+  always:
+    - name: Cleanup banners (always)
+      include_tasks: banner_cleanup.yml
+      when: (restart_banner_enabled | default(true)) | bool
+
+Note: The Enrich profile batches with batch_sources block uses map('combine', ...) with per-item context; if your controller flags it, I can rewrite it as a simple loop that builds a new list. But on AAP 2.6, this should work fine.
+
+3) UPDATED roles/websphere_jvm_restart/tasks/restart_profile.yml
+
+Adds banner field:
+
+Discovery Source(s): ps_words,filesystem_cache
+
+Also ensures record_one_jvm.yml receives source_map.
+
+---
+# Inputs:
+# profile_dir, profile_bin, jvm_owner, profile_jvms, profile_name_for_ps
+# batch_source_summary, source_map
+
+- name: Debug - profile batch inputs
+  when: wsjvm_debug | bool
+  debug:
+    msg:
+      host: "{{ inventory_hostname }}"
+      profile_dir: "{{ profile_dir }}"
+      profile_bin: "{{ profile_bin }}"
+      owner: "{{ jvm_owner }}"
+      jvms: "{{ profile_jvms }}"
+      discovery_sources: "{{ batch_source_summary | default('') }}"
+
+# Banner (adds discovery sources)
+- name: Set host banner once for this owner
+  when: (restart_banner_enabled | default(true)) | bool
+  include_tasks: banner_set_host.yml
+  vars:
+    banner_owner: "{{ jvm_owner }}"
+    banner_lines:
+      - "RITM: {{ ritm_number }}"
+      - "Timestamp: {{ lookup('pipe', 'date \"+%Y-%m-%d %H:%M:%S %Z\"') }}"
+      - "Contact/Team: {{ wsjvm_contact_team }}"
+      - "Change Window: {{ wsjvm_change_window }}"
+      - "Environment: {{ env_name | default('na') }}"
+      - "Host: {{ inventory_hostname }}"
+      - "Profile: {{ profile_dir | basename }}"
+      - "JVMs: {{ profile_jvms | join(', ') }}"
+      - "Discovery Source(s): {{ batch_source_summary | default('unknown') }}"
+
+# serverStatus PRE
+- name: Run serverStatus.sh -all (pre)
+  shell: "{{ profile_bin }}/serverStatus.sh -all"
+  register: server_status_pre
+  become: true
+  become_user: "{{ jvm_owner }}"
+  changed_when: false
+  failed_when: false
+
+- name: Initialize pre classification lists
+  set_fact:
+    jvms_started_pre: []
+    jvms_stopped_pre: []
+
+- name: Classify each JVM (STARTED + STOPPED for AppServer/nodeagent/dmgr)
+  set_fact:
+    jvms_started_pre: "{{ jvms_started_pre + ([one_jvm_trim] if started_hit else []) }}"
+    jvms_stopped_pre: "{{ jvms_stopped_pre + ([one_jvm_trim] if stopped_hit else []) }}"
+  vars:
+    one_jvm_trim: "{{ one_jvm | trim }}"
+    started_hit: >-
+      {{
+        (
+          (one_jvm_trim == 'nodeagent' and (server_status_pre.stdout | default('') | regex_search('ADMU0508I: The Node Agent \"nodeagent\" is STARTED')) is not none)
+          or
+          (one_jvm_trim == 'dmgr' and (server_status_pre.stdout | default('') | regex_search('ADMU0508I: The Deployment Manager \"dmgr\" is STARTED')) is not none)
+          or
+          (one_jvm_trim not in ['dmgr','nodeagent'] and (server_status_pre.stdout | default('') | regex_search('ADMU0508I: The Application Server \"' ~ (one_jvm_trim | regex_escape) ~ '\" is STARTED')) is not none)
+        )
+      }}
+    stopped_hit: >-
+      {{
+        (
+          (one_jvm_trim == 'nodeagent' and (server_status_pre.stdout | default('') | regex_search('ADMU0509I: The Node Agent \"nodeagent\" cannot be reached')) is not none)
+          or
+          (one_jvm_trim == 'dmgr' and (server_status_pre.stdout | default('') | regex_search('ADMU0509I: The Deployment Manager \"dmgr\" cannot be reached')) is not none)
+          or
+          (one_jvm_trim not in ['dmgr','nodeagent'] and (server_status_pre.stdout | default('') | regex_search('ADMU0509I: The Application Server \"' ~ (one_jvm_trim | regex_escape) ~ '\" cannot be reached')) is not none)
+        )
+      }}
+  loop: "{{ profile_jvms }}"
+  loop_control:
+    loop_var: one_jvm
+    label: "{{ inventory_hostname }} -> classify {{ one_jvm_trim }}"
+
+- name: Ensure all JVMs classified (started+stopped must equal requested)
+  assert:
+    that:
+      - (jvms_started_pre | length) + (jvms_stopped_pre | length) == (profile_jvms | length)
+    fail_msg: >-
+      Some JVMs were not found/classified in serverStatus output for profile {{ profile_dir | basename }}.
+      Requested={{ profile_jvms }}, started={{ jvms_started_pre }}, stopped={{ jvms_stopped_pre }}
+
+# Start stopped
+- name: Start STOPPED JVMs
+  include_tasks: start_one_jvm.yml
+  loop: "{{ jvms_stopped_pre }}"
+  loop_control:
+    loop_var: stopped_jvm
+    label: "{{ inventory_hostname }} -> start {{ stopped_jvm }}"
+
+# Restart started
+- name: Restart STARTED JVMs safely
+  include_tasks: restart_started_jvm.yml
+  loop: "{{ jvms_started_pre }}"
+  loop_control:
+    loop_var: started_jvm
+    label: "{{ inventory_hostname }} -> restart {{ started_jvm }}"
+  vars:
+    jvm_owner_for_restart: "{{ jvm_owner }}"
+    profile_bin_for_restart: "{{ profile_bin }}"
+    profile_name_for_restart: "{{ profile_name_for_ps }}"
+
+# Build expected STARTED lines
+- name: Reset expected_started_lines
+  set_fact:
+    expected_started_lines: []
+  changed_when: false
+
+- name: Build expected STARTED lines for all JVMs in this profile
+  include_tasks: build_expected_started_line_one.yml
+  loop: "{{ profile_jvms | map('trim') | unique | list }}"
+  loop_control:
+    loop_var: expected_jvm
+
+# Post wait (expected-lines membership)
+- name: Wait until all JVMs are STARTED (post) - expected lines membership
+  shell: "{{ profile_bin }}/serverStatus.sh -all"
+  register: server_status_post
+  become: true
+  become_user: "{{ jvm_owner }}"
+  changed_when: false
+  failed_when: false
+  retries: "{{ restart_wait_retries }}"
+  delay: "{{ restart_wait_delay }}"
+  vars:
+    normalized_lines: >-
+      {{
+        (server_status_post.stdout_lines | default([]))
+        | map('regex_replace', '\r', '')
+        | map('regex_replace', '[ \t]+', ' ')
+        | map('trim')
+        | list
+      }}
+    normalized_expected: >-
+      {{
+        expected_started_lines
+        | map('regex_replace', '\r', '')
+        | map('regex_replace', '[ \t]+', ' ')
+        | map('trim')
+        | list
+      }}
+    present_count: "{{ normalized_expected | select('in', normalized_lines) | list | length }}"
+    expected_count: "{{ normalized_expected | length }}"
+    missing_started_lines: "{{ normalized_expected | reject('in', normalized_lines) | list }}"
+  until: present_count == expected_count
+
+# Record results (passes source_map implicitly via vars)
+- name: Record results for each JVM
+  include_tasks: record_one_jvm.yml
+  loop: "{{ profile_jvms }}"
+  loop_control:
+    loop_var: result_jvm
+    label: "{{ inventory_hostname }} -> record {{ result_jvm }}"
+4) UPDATED roles/websphere_jvm_restart/tasks/record_one_jvm.yml
+
+Adds discovery_source into result using source_map.
+
+---
+- name: Normalize result JVM
+  set_fact:
+    result_jvm_norm: "{{ result_jvm | trim }}"
+  changed_when: false
+
+# PS after
+- name: PS after for DMGR
+  shell: "ps -ef | grep dmgr | grep {{ (profile_dir | basename) | quote }} | grep -v grep"
+  register: _ps_after
+  changed_when: false
+  failed_when: false
+  when: result_jvm_norm == 'dmgr'
+
+- name: PS after for NODEAGENT
+  shell: "ps -ef | grep nodeagent | grep {{ (profile_dir | basename) | quote }} | grep -v grep"
+  register: _ps_after
+  changed_when: false
+  failed_when: false
+  when: result_jvm_norm == 'nodeagent'
+
+- name: PS after for AppServer
+  shell: "ps -ef | grep java | grep {{ result_jvm_norm | quote }} | grep -v grep"
+  register: _ps_after
+  changed_when: false
+  failed_when: false
+  when: result_jvm_norm not in ['dmgr','nodeagent']
+
+- name: Normalize serverStatus post lines
+  set_fact:
+    _post_lines_norm: >-
+      {{
+        (server_status_post.stdout_lines | default([]))
+        | map('regex_replace', '\r', '')
+        | map('regex_replace', '[ \t]+', ' ')
+        | map('trim')
+        | list
+      }}
+  changed_when: false
+
+- name: Init expected started line
+  set_fact:
+    _expected_started_line: ""
+  changed_when: false
+
+- name: Expected STARTED line for NODEAGENT
+  set_fact:
+    _expected_started_line: 'ADMU0508I: The Node Agent "nodeagent" is STARTED'
+  changed_when: false
+  when: result_jvm_norm == 'nodeagent'
+
+- name: Expected STARTED line for DMGR
+  set_fact:
+    _expected_started_line: 'ADMU0508I: The Deployment Manager "dmgr" is STARTED'
+  changed_when: false
+  when: result_jvm_norm == 'dmgr'
+
+- name: Expected STARTED line for Application Server
+  set_fact:
+    _expected_started_line: "ADMU0508I: The Application Server \"{{ result_jvm_norm }}\" is STARTED"
+  changed_when: false
+  when: result_jvm_norm not in ['dmgr','nodeagent']
+
+- name: Extract pid/cell and started_ok
+  set_fact:
+    ps_after_lines: "{{ _ps_after.stdout_lines | default([]) }}"
+    new_pid: "{{ (ps_after_lines | length > 0) | ternary((ps_after_lines[0].split()[1]), 'not found via ps') }}"
+    cell_name: "{{ (ps_after_lines | length > 0) | ternary((ps_after_lines[0].split()[-3]), 'unknown') }}"
+    started_ok: "{{ (_expected_started_line | length > 0) and (_expected_started_line in _post_lines_norm) }}"
+  changed_when: false
+
+- name: Append per-JVM result (includes discovery_source)
+  set_fact:
+    jvm_results: >-
+      {{
+        jvm_results + [
+          {
+            'env_name': (env_name | default('na')),
+            'env_host_profile_jvm': ((env_name | default('na')) ~ ':' ~ inventory_hostname ~ ':' ~ (profile_dir | basename) ~ ':' ~ result_jvm_norm),
+            'status': ( 'success' if started_ok else 'failed' ),
+            'profile_dir': profile_dir,
+            'cell_name': cell_name,
+            'new_pid': new_pid,
+            'discovery_source': (source_map.get(result_jvm_norm, 'unknown') if source_map is defined else 'unknown'),
+            'action': ( 'restart' if (result_jvm_norm in (jvms_started_pre | default([]))) else 'start' ),
+            'reason': ( '' if started_ok else ('Not STARTED after operations (missing: ' ~ _expected_started_line ~ ')') )
+          }
+        ]
+      }}
