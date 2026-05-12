@@ -267,6 +267,24 @@ This role is designed to be idempotent:
 - ✅ Reconciliation only occurs when explicitly requested
 - ✅ Safe to include in multiple plays
 
+## CyberArk Permissions Required
+
+### For Password Retrieval
+- ✅ **List Accounts** - Query and find accounts
+- ✅ **Retrieve Accounts** - Get password values
+- ✅ **View Safe Members** - Access safe
+
+### For Password Reconciliation (Additional)
+- ✅ **Initiate CPM Account Management Operations** - **REQUIRED** to trigger reconciliation
+- ⚠️ **Specify Next Account Content** - Optional, for setting specific passwords
+
+### Account Requirements for Reconciliation
+- CPM (Central Password Manager) must be enabled on the account
+- Reconcile account must be configured
+- Platform must support reconciliation
+
+**See [CYBERARK_PERMISSIONS.md](CYBERARK_PERMISSIONS.md) for detailed permission setup guide.**
+
 ## Security Considerations
 
 1. **Session Management**: Role automatically creates and terminates CyberArk sessions
@@ -275,6 +293,7 @@ This role is designed to be idempotent:
 4. **Use Ansible Vault**: Encrypt sensitive variables like certificate paths
 5. **Limit access**: Ensure CyberArk safe permissions are properly configured
 6. **Audit trail**: CyberArk logs all access with the provided reason
+7. **Least Privilege**: Only grant reconcile permissions when needed
 
 ## Troubleshooting
 

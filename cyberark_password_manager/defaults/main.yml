@@ -6,22 +6,39 @@ cyberark_env: ""  # Options: intg, prod (leave empty to use manual configuration
 # Environment-specific configurations
 cyberark_environments:
   intg:
+    # For password retrieval (cert-based auth)
     api_base_url: "https://cyberark-intg.example.com"
     client_cert: "/etc/ansible/certs/intg/client.crt"
     client_key: "/etc/ansible/certs/intg/client.key"
     safe_name: "INTG_SAFE"
+    # For password reconciliation (username/password session auth)
+    reconcile_api_base_url: "https://cyberark-reconcile-intg.example.com"
+    reconcile_username: ""
+    reconcile_password: ""
   prod:
+    # For password retrieval (cert-based auth)
     api_base_url: "https://cyberark-prod.example.com"
     client_cert: "/etc/ansible/certs/prod/client.crt"
     client_key: "/etc/ansible/certs/prod/client.key"
     safe_name: "PROD_SAFE"
+    # For password reconciliation (username/password session auth)
+    reconcile_api_base_url: "https://cyberark-reconcile-prod.example.com"
+    reconcile_username: ""
+    reconcile_password: ""
 
 # Manual Configuration (used when cyberark_env is not set)
 # These will be overridden if cyberark_env is specified
+
+# For password retrieval (cert-based authentication)
 cyberark_api_base_url: "https://cyberark.example.com"
-cyberark_client_cert: ""  # Path to client certificate file for session authentication
-cyberark_client_key: ""   # Path to client key file for session authentication
+cyberark_client_cert: ""  # Path to client certificate file
+cyberark_client_key: ""   # Path to client key file
 cyberark_safe_name: ""
+
+# For password reconciliation (username/password session authentication)
+cyberark_reconcile_api_base_url: ""  # Can be different from retrieval URL
+cyberark_reconcile_username: ""
+cyberark_reconcile_password: ""
 
 # Common Configuration
 cyberark_validate_certs: true

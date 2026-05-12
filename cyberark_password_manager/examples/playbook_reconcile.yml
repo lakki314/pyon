@@ -1,17 +1,23 @@
 ---
 # Example playbook: Retrieve and reconcile passwords from CyberArk
-# This example shows how to reconcile passwords (trigger password change) using session-based authentication
+# Retrieval uses certificate authentication, reconciliation uses username/password session
 
 - name: Retrieve and reconcile passwords from CyberArk
   hosts: localhost
   gather_facts: false
   
   vars:
-    # CyberArk connection details
+    # CyberArk connection details for retrieval (cert-based)
     cyberark_api_base_url: "https://cyberark.example.com"
     cyberark_client_cert: "/etc/ansible/certs/client.crt"
     cyberark_client_key: "/etc/ansible/certs/client.key"
     cyberark_safe_name: "PROD_SAFE"
+    
+    # CyberArk connection details for reconciliation (username/password session)
+    cyberark_reconcile_api_base_url: "https://cyberark-reconcile.example.com"
+    cyberark_reconcile_username: "reconcile_user"
+    cyberark_reconcile_password: "{{ vault_reconcile_password }}"  # Use Ansible Vault
+    
     cyberark_reason: "Scheduled password rotation via Ansible"
     
     # Define user accounts

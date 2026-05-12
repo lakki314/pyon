@@ -22,10 +22,11 @@
   ansible.builtin.set_fact:
     _password_already_set: "{{ _password_var_name in vars and vars[_password_var_name] is defined and vars[_password_var_name] | length > 0 }}"
 
-- name: Retrieve current password from CyberArk using session
+- name: Retrieve current password from CyberArk using certificate authentication
   cyberark.pas.cyberark_credential:
     api_base_url: "{{ cyberark_api_base_url }}"
-    cyberark_session: "{{ _cyberark_session }}"
+    client_cert: "{{ cyberark_client_cert }}"
+    client_key: "{{ cyberark_client_key }}"
     query: "{{ _account_object_query }}"
     validate_certs: "{{ cyberark_validate_certs }}"
     connection_timeout: "{{ cyberark_connection_timeout }}"
@@ -64,9 +65,9 @@
     - _cyberark_result.result is defined
     - _cyberark_result.result.Content is defined
 
-- name: Reconcile password in CyberArk using session (if requested)
+- name: Reconcile password in CyberArk using username/password session (if requested)
   cyberark.pas.cyberark_account:
-    api_base_url: "{{ cyberark_api_base_url }}"
+    api_base_url: "{{ cyberark_reconcile_api_base_url }}"
     cyberark_session: "{{ _cyberark_session }}"
     query: "{{ _account_object_query }}"
     validate_certs: "{{ cyberark_validate_certs }}"
@@ -83,10 +84,11 @@
     - _cyberark_reconcile_result is failed
     - cyberark_fail_on_error | bool
 
-- name: Retrieve new password after reconciliation
+- name: Retrieve new password after reconciliation using certificate authentication
   cyberark.pas.cyberark_credential:
     api_base_url: "{{ cyberark_api_base_url }}"
-    cyberark_session: "{{ _cyberark_session }}"
+    client_cert: "{{ cyberark_client_cert }}"
+    client_key: "{{ cyberark_client_key }}"
     query: "{{ _account_object_query }}"
     validate_certs: "{{ cyberark_validate_certs }}"
     connection_timeout: "{{ cyberark_connection_timeout }}"

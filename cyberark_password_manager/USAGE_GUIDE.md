@@ -215,6 +215,24 @@ The role is idempotent:
 - ✅ No unnecessary API calls to CyberArk
 - ✅ Safe to include in multiple plays
 
+## CyberArk Permissions
+
+### Required Permissions for Retrieve
+- ✅ List Accounts
+- ✅ Retrieve Accounts
+- ✅ View Safe Members
+
+### Additional Permissions for Reconcile
+- ✅ **Initiate CPM Account Management Operations** (CRITICAL)
+- ⚠️ Specify Next Account Content (optional)
+
+### Account Setup for Reconcile
+- CPM must be enabled on the account
+- Reconcile account must be configured
+- Platform must support reconciliation
+
+**📖 See [CYBERARK_PERMISSIONS.md](CYBERARK_PERMISSIONS.md) for complete permission setup guide.**
+
 ## Security Best Practices
 
 1. **Never log passwords:**
@@ -239,6 +257,10 @@ The role is idempotent:
    - Sessions are automatically created and terminated
    - No session tokens are exposed in logs
    - All session operations use `no_log: true`
+
+5. **Least Privilege:**
+   - Only grant reconcile permissions when needed
+   - Use separate certificates for different environments
 
 ## Troubleshooting
 

@@ -1,6 +1,7 @@
 ---
 # Example playbook: Using environment-based configuration
 # This example shows how to use cyberark_env to automatically select intg or prod configuration
+# Retrieval uses certificate auth, reconciliation uses username/password session auth
 
 - name: Retrieve passwords from CyberArk Integration Environment
   hosts: localhost
@@ -24,8 +25,8 @@
         msg: "Successfully retrieved passwords from Integration environment"
 
 ---
-# Example: Production environment
-- name: Retrieve passwords from CyberArk Production Environment
+# Example: Production environment with reconciliation
+- name: Retrieve and reconcile passwords from CyberArk Production
   hosts: localhost
   gather_facts: false
   
@@ -36,14 +37,21 @@
     # Same user accounts work across environments
     was_user: wasadmin
     mq_user: mqm
+    
+    # Configure reconciliation
+    cyberark_account_config:
+      was_user:
+        reconcile: true
+      mq_user:
+        reconcile: true
 
   roles:
     - cyberark_password_manager
 
   post_tasks:
-    - name: Verify passwords were retrieved from PROD
+    - name: Verify passwords were reconciled in PROD
       ansible.builtin.debug:
-        msg: "Successfully retrieved passwords from Production environment"
+        msg: "Successfully reconciled passwords in Production environment"
 
 ---
 # Example: Environment from inventory or extra vars

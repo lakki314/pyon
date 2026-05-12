@@ -7,6 +7,9 @@
     cyberark_client_cert: "{{ cyberark_environments[cyberark_env].client_cert }}"
     cyberark_client_key: "{{ cyberark_environments[cyberark_env].client_key }}"
     cyberark_safe_name: "{{ cyberark_environments[cyberark_env].safe_name }}"
+    cyberark_reconcile_api_base_url: "{{ cyberark_environments[cyberark_env].reconcile_api_base_url }}"
+    cyberark_reconcile_username: "{{ cyberark_environments[cyberark_env].reconcile_username }}"
+    cyberark_reconcile_password: "{{ cyberark_environments[cyberark_env].reconcile_password }}"
   when:
     - cyberark_env is defined
     - cyberark_env | length > 0
@@ -49,14 +52,19 @@
   failed_when: not _key_check.stat.exists
   changed_when: false
 
-- name: Create CyberArk session using certificate authentication
+- name: Check if any account needs reconciliation
+  ansible.builtin.set_fact:
+    _needs_reconcile: "{{ cyberark_account_config.values() | selectattr('reconcile', 'defined') | selectattr('reconcile', 'equalto', true) | list | length > 0 }}"
+
+- name: Create CyberArk session for reconciliation (username/password auth)
   cyberark.pas.cyberark_authentication:
-    api_base_url: "{{ cyberark_api_base_url }}"
-    client_cert: "{{ cyberark_client_cert }}"
-    client_key: "{{ cyberark_client_key }}"
+    api_base_url: "{{ cyberark_reconcile_api_base_url }}"
+    username: "{{ cyberark_reconcile_username }}"
+    password: "{{ cyberark_reconcile_password }}"
     validate_certs: "{{ cyberark_validate_certs }}"
   register: _cyberark_session
   no_log: true
+  when: _needs_reconcile | bool
 
 - name: Discover user variables ending with _user
   ansible.builtin.set_fact:
@@ -88,11 +96,13 @@
     label: "{{ item.key }}"
   no_log: true
 
-- name: Logoff from CyberArk session
+- name: Logoff from CyberArk reconciliation session
   cyberark.pas.cyberark_authentication:
-    api_base_url: "{{ cyberark_api_base_url }}"
+    api_base_url: "{{ cyberark_reconcile_api_base_url }}"
     cyberark_session: "{{ _cyberark_session }}"
     validate_certs: "{{ cyberark_validate_certs }}"
     state: absent
   no_log: true
-  when: _cyberark_session is defined
+  when:
+    - _needs_reconcile | bool
+    - _cyberark_session is defined
