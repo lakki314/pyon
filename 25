@@ -1,21 +1,63 @@
-- name: Process all profile batches with guaranteed cleanup
-  block:
-    - name: Process each profile batch
-      include_tasks: restart_profile.yml
-      loop: "{{ profile_batch_list }}"
-      loop_control:
-        loop_var: profile_batch
-        label: "{{ inventory_hostname }} -> {{ profile_batch.profile_name }} -> {{ profile_batch.jvms | join(',') }}"
-      vars:
-        profile_dir: "{{ profile_batch.profile_dir }}"
-        profile_bin: "{{ profile_batch.profile_bin }}"
-        jvm_owner: "{{ profile_batch.jvm_owner }}"
-        profile_jvms: "{{ profile_batch.jvms | map('trim') | unique | list }}"
-        profile_name_for_ps: "{{ profile_batch.profile_name }}"
-        batch_sources: "{{ profile_batch.batch_sources | default([]) }}"
-        batch_source_summary: "{{ (profile_batch.batch_sources | default([])) | unique | join(',') }}"
-        source_map: "{{ source_map }}"
-  always:
-    - name: Cleanup banners (always)
-      when: (restart_banner_enabled | default(true)) | bool
-      include_tasks: banner_cleanup.yml
+Add this task just before the “Append per-JVM result” task:
+
+- name: Safe source_map lookup
+  set_fact:
+    _src_map: "{{ source_map | default({}) }}"
+    _discovery_source: >-
+      {{
+        (
+          (source_map | default({})).get(result_jvm_norm, 'unknown')
+          if (source_map | default({})) is mapping
+          else 'unknown'
+        )
+      }}
+  changed_when: false
+
+Then in the “Append per-JVM result” task, use _discovery_source:
+
+- name: Append per-JVM result (includes discovery_source)
+  set_fact:
+    jvm_results: >-
+      {{
+        jvm_results + [
+          {
+            'env_name': (env_name | default('na')),
+            'env_host_profile_jvm': ((env_name | default('na')) ~ ':' ~ inventory_hostname ~ ':' ~ (profile_dir | basename) ~ ':' ~ result_jvm_norm),
+            'status': ( 'success' if started_ok else 'failed' ),
+            'profile_dir': profile_dir,
+            'cell_name': cell_name,
+            'new_pid': new_pid,
+            'discovery_source': _discovery_source,
+            'action': ( 'restart' if (result_jvm_norm in (jvms_started_pre | default([]))) else 'start' ),
+            'reason': ( '' if started_ok else ('Not STARTED after operations (missing: ' ~ _expected_started_line ~ ')') )
+          }
+        ]
+      }}
+
+This guarantees:
+
+if source_map is missing → 'unknown'
+if source_map exists but isn’t a dict → 'unknown'
+if it’s a dict → .get() works safely
+Also make sure source_map is passed into the profile batch include
+
+In execute_on_host.yml (where you call restart_profile.yml), confirm you have:
+
+vars:
+  source_map: "{{ source_map }}"
+
+You already intended this, but if it’s missing, source_map won’t exist inside the nested includes.
+
+Quick debug (optional)
+
+Add this in restart_profile.yml near the top to verify the variable shape:
+
+- name: Debug source_map type
+  when: wsjvm_debug | bool
+  debug:
+    msg:
+      source_map_defined: "{{ source_map is defined }}"
+      source_map_is_mapping: "{{ (source_map | default({})) is mapping }}"
+      source_map_keys_sample: "{{ (source_map | default({})).keys() | list | default([]) }}"
+
+If you paste the exact exception text (the line number + message), I can point to the exact Jinja expression that blew up, but the safe-lookup pattern above resolves this class of failures completely.
