@@ -1,0 +1,291 @@
+roles/websphere_jvm_restart/tasks/find_profile_for_stopped_jvm.yml (UPDATED)
+
+Changes included:
+
+Parses manageprofiles.sh -listProfiles output like [dmgr_profile, node_profile]
+Uses serverStatus.sh -all per profile to find membership via ADMU0506I: Server name: <jvm>
+---
+# Find owning profile for a STOPPED JVM using:
+#  - manageprofiles.sh -listProfiles
+#  - serverStatus.sh -all for each profile
+#
+# Inputs:
+#   stopped_jvm_name
+# Uses/sets:
+#   cached_install_root, cached_install_owner
+# Outputs:
+#   discovered_profile_name, discovered_profile_dir, discovered_profile_bin
+
+- name: Populate install root cache if empty
+  when: cached_install_root | length == 0
+  block:
+    - name: Check install roots
+      stat:
+        path: "{{ install_root }}"
+      loop: "{{ was_install_roots }}"
+      loop_control:
+        loop_var: install_root
+      register: install_root_stats
+
+    - name: Select first existing install root
+      set_fact:
+        cached_install_root: >-
+          {{
+            (install_root_stats.results
+              | selectattr('stat.exists','equalto',true)
+              | map(attribute='install_root')
+              | list
+              | first) | default('')
+          }}
+
+    - name: Fail if no install root exists
+      assert:
+        that:
+          - cached_install_root | length > 0
+        fail_msg: "No WebSphere install root found on {{ inventory_hostname }}."
+
+    - name: Determine cached owner (install root)
+      stat:
+        path: "{{ cached_install_root }}"
+      register: cached_root_stat
+
+    - set_fact:
+        cached_install_owner: "{{ cached_root_stat.stat.pw_name | default('') }}"
+    - when: cached_install_owner | length == 0
+      block:
+        - shell: "ls -ld {{ cached_install_root }} | awk '{print $3}'"
+          register: cached_owner_cmd
+          changed_when: false
+        - set_fact:
+            cached_install_owner: "{{ cached_owner_cmd.stdout | trim }}"
+
+- name: Validate manageprofiles.sh exists
+  stat:
+    path: "{{ cached_install_root | regex_replace('/$', '') }}/bin/manageprofiles.sh"
+  register: mp_stat
+
+- name: Fail if manageprofiles.sh not found
+  assert:
+    that:
+      - mp_stat.stat.exists | default(false)
+    fail_msg: "manageprofiles.sh not found under {{ cached_install_root }}/bin. Cannot discover profiles."
+
+- name: List profiles using manageprofiles.sh -listProfiles
+  shell: "{{ cached_install_root | regex_replace('/$', '') }}/bin/manageprofiles.sh -listProfiles"
+  register: mp_list
+  changed_when: false
+  failed_when: false
+  become: true
+
+- name: Parse profile names from manageprofiles output (supports [a, b] format)
+  set_fact:
+    _profiles: >-
+      {{
+        (
+          (mp_list.stdout | default('') | trim)
+          | regex_replace('^\\[', '')
+          | regex_replace('\\]$', '')
+          | split(',')
+          | map('trim')
+          | reject('equalto','')
+          | list
+        )
+        if ((mp_list.stdout | default('') | trim) is string and (mp_list.stdout | default('') | trim) | length > 0)
+        else
+        (
+          (mp_list.stdout_lines | default([]))
+          | map('trim')
+          | reject('equalto','')
+          | list
+        )
+      }}
+  changed_when: false
+
+- name: Debug - parsed profile list
+  when: wsjvm_debug | bool
+  debug:
+    msg:
+      raw_manageprofiles: "{{ mp_list.stdout | default('') | trim }}"
+      parsed_profiles: "{{ _profiles }}"
+
+- name: Fail if no profiles returned by manageprofiles
+  assert:
+    that:
+      - _profiles | length > 0
+    fail_msg: "manageprofiles.sh returned no profiles on {{ inventory_hostname }}."
+
+- name: Check which profile contains the stopped JVM via serverStatus.sh -all
+  shell: "{{ cached_install_root | regex_replace('/$', '') }}/profiles/{{ prof }}/bin/serverStatus.sh -all"
+  register: prof_status
+  changed_when: false
+  failed_when: false
+  become: true
+  loop: "{{ _profiles }}"
+  loop_control:
+    loop_var: prof
+    label: "{{ prof }}"
+
+- name: Pick the first matching profile (by ADMU0506I Server name)
+  set_fact:
+    _match: >-
+      {{
+        (prof_status.results | default([]))
+        | selectattr('stdout', 'defined')
+        | selectattr('stdout', 'search', 'ADMU0506I: Server name: ' ~ (stopped_jvm_name | regex_escape))
+        | list
+        | first | default({})
+      }}
+  changed_when: false
+
+- name: Set discovered profile facts
+  set_fact:
+    discovered_profile_name: "{{ _match.prof | default('') }}"
+    discovered_profile_dir: "{{ cached_install_root | regex_replace('/$', '') }}/profiles/{{ _match.prof | default('') }}"
+    discovered_profile_bin: "{{ cached_install_root | regex_replace('/$', '') }}/profiles/{{ _match.prof | default('') }}/bin"
+  changed_when: false
+
+- name: Fail if stopped JVM profile not found from serverStatus checks
+  assert:
+    that:
+      - discovered_profile_name | length > 0
+    fail_msg: >-
+      Could not find a profile containing server '{{ stopped_jvm_name }}' using serverStatus.sh -all.
+      Checked profiles: {{ _profiles }}
+roles/websphere_jvm_restart/tasks/discover_jvm.yml (UPDATED)
+
+Changes included:
+
+If ps_words parsing doesn’t produce profile info OR JVM not running, uses the updated find_profile_for_stopped_jvm.yml
+Finalizes profile name/dir/bin from those discovered facts
+---
+# Inputs: jvm_name
+# Output appended to discovered_jvms:
+# { jvm_name, jvm_owner, profile_name, cell_name, profile_dir, profile_bin, discovery_source }
+
+- name: Initialize discovery vars
+  set_fact:
+    _ps_line: ""
+    _ps_lines: []
+    _profile_dir: ""
+    _profile_bin: ""
+    _profile_name: ""
+    _cell_name: ""
+    _jvm_owner: ""
+    _config_path: ""
+    discovered_profile_name: ""
+    discovered_profile_dir: ""
+    discovered_profile_bin: ""
+    _discovery_source: ""
+  changed_when: false
+
+# --- PS lookup rules ---
+- name: PS lookup for dmgr
+  shell: "ps -ef | grep dmgr | grep -v grep"
+  register: _ps
+  changed_when: false
+  failed_when: false
+  when: (jvm_name | trim) == 'dmgr'
+
+- name: PS lookup for nodeagent
+  shell: "ps -ef | grep nodeagent | grep -v grep"
+  register: _ps
+  changed_when: false
+  failed_when: false
+  when: (jvm_name | trim) == 'nodeagent'
+
+- name: PS lookup for appserver
+  shell: "ps -ef | grep java | grep {{ (jvm_name | trim) | quote }} | grep -v grep"
+  register: _ps
+  changed_when: false
+  failed_when: false
+  when: (jvm_name | trim) not in ['dmgr','nodeagent']
+
+- name: Pick first ps line if any
+  set_fact:
+    _ps_lines: "{{ _ps.stdout_lines | default([]) }}"
+    _ps_line: "{{ (_ps.stdout_lines | default([]) | first | default('')) }}"
+  changed_when: false
+
+- name: If running, derive owner from ps
+  set_fact:
+    _jvm_owner: "{{ (_ps_line.split()[0] if (_ps_line | length > 0) else '') }}"
+  changed_when: false
+
+# --- Parse profile info from ps_words (last-4-words rule) ---
+- name: Parse profile info from ps_words (last-4-words rule)
+  set_fact:
+    _ps_words: "{{ _ps_line.split() }}"
+  changed_when: false
+
+- name: Derive profile_name/cell/config/profile_dir/profile_bin from ps_words
+  set_fact:
+    _config_path: "{{ _ps_words[-4] }}"
+    _cell_name: "{{ _ps_words[-3] }}"
+    _profile_name: "{{ _ps_words[-2] }}"
+    _profile_dir: "{{ (_ps_words[-4] | regex_replace('/config$', '')) }}"
+    _profile_bin: "{{ (_ps_words[-4] | regex_replace('/config$', '')) ~ '/bin' }}"
+  changed_when: false
+  when:
+    - _ps_line | length > 0
+    - _ps_words | length >= 4
+    - (_ps_words[-1] | trim) == (jvm_name | trim)
+
+# If ps_words parsing failed OR JVM not running, find profile via manageprofiles/serverStatus
+- name: Find profile for stopped JVM (manageprofiles + serverStatus)
+  include_tasks: find_profile_for_stopped_jvm.yml
+  when: _profile_dir | length == 0
+  vars:
+    stopped_jvm_name: "{{ jvm_name | trim }}"
+
+- name: Finalize profile_dir/profile_bin/profile_name if from manageprofiles discovery
+  set_fact:
+    _profile_dir: "{{ _profile_dir if (_profile_dir | length > 0) else discovered_profile_dir }}"
+    _profile_bin: "{{ _profile_bin if (_profile_bin | length > 0) else discovered_profile_bin }}"
+    _profile_name: "{{ _profile_name if (_profile_name | length > 0) else discovered_profile_name }}"
+    _cell_name: "{{ _cell_name if (_cell_name | length > 0) else 'unknown' }}"
+    _jvm_owner: "{{ _jvm_owner if (_jvm_owner | length > 0) else cached_install_owner }}"
+  changed_when: false
+
+- name: Set discovery_source
+  set_fact:
+    _discovery_source: "{{ 'ps_words' if (_ps_line | length > 0 and _config_path | length > 0 and _profile_dir | length > 0) else 'filesystem_cache' }}"
+  changed_when: false
+
+- name: Validate discovered profile_dir/profile_bin/profile_name
+  assert:
+    that:
+      - _profile_dir | length > 0
+      - _profile_bin | length > 0
+      - _profile_name | length > 0
+    fail_msg: "Could not determine profile_dir/profile_bin/profile_name for JVM {{ jvm_name }} on {{ inventory_hostname }}."
+
+- name: Append discovered JVM (with discovery_source)
+  set_fact:
+    discovered_jvms: >-
+      {{
+        discovered_jvms + [
+          {
+            'jvm_name': (jvm_name | trim),
+            'jvm_owner': _jvm_owner,
+            'profile_name': _profile_name,
+            'cell_name': _cell_name,
+            'profile_dir': _profile_dir,
+            'profile_bin': _profile_bin,
+            'discovery_source': _discovery_source
+          }
+        ]
+      }}
+  changed_when: false
+
+- name: Debug - discovery result with source
+  when: wsjvm_debug | bool
+  debug:
+    msg:
+      jvm: "{{ jvm_name | trim }}"
+      source: "{{ _discovery_source }}"
+      owner: "{{ _jvm_owner }}"
+      profile_name: "{{ _profile_name }}"
+      cell_name: "{{ _cell_name }}"
+      profile_dir: "{{ _profile_dir }}"
+      profile_bin: "{{ _profile_bin }}"
+      ps_line_used: "{{ _ps_line }}"
