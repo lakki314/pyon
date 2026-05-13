@@ -1,0 +1,165 @@
+---
+# Find owning profile for a STOPPED JVM using:
+#  - manageprofiles.sh -listProfiles (path depends on commonprofile)
+#  - serverStatus.sh -all for each profile
+#
+# Inputs:
+#   stopped_jvm_name
+# Uses/sets:
+#   cached_install_root, cached_install_owner
+# Outputs:
+#   discovered_profile_name, discovered_profile_dir, discovered_profile_bin
+
+- name: Populate install root cache if empty
+  when: cached_install_root | length == 0
+  block:
+    - name: Check install roots
+      stat:
+        path: "{{ install_root }}"
+      loop: "{{ was_install_roots }}"
+      loop_control:
+        loop_var: install_root
+      register: install_root_stats
+
+    - name: Select first existing install root
+      set_fact:
+        cached_install_root: >-
+          {{
+            (install_root_stats.results
+              | selectattr('stat.exists','equalto',true)
+              | map(attribute='install_root')
+              | list
+              | first) | default('')
+          }}
+
+    - name: Fail if no install root exists
+      assert:
+        that:
+          - cached_install_root | length > 0
+        fail_msg: "No WebSphere install root found on {{ inventory_hostname }}."
+
+    - name: Determine cached owner (install root)
+      stat:
+        path: "{{ cached_install_root }}"
+      register: cached_root_stat
+
+    - set_fact:
+        cached_install_owner: "{{ cached_root_stat.stat.pw_name | default('') }}"
+    - when: cached_install_owner | length == 0
+      block:
+        - shell: "ls -ld {{ cached_install_root }} | awk '{print $3}'"
+          register: cached_owner_cmd
+          changed_when: false
+        - set_fact:
+            cached_install_owner: "{{ cached_owner_cmd.stdout | trim }}"
+
+# ---- NEW: manageprofiles path selector for commonprofile ----
+- name: Determine manageprofiles base path
+  set_fact:
+    _install_root_norm: "{{ cached_install_root | regex_replace('/$', '') }}"
+    _manageprofiles_path: >-
+      {{
+        (
+          (cached_install_root | regex_search('commonprofile')) is not none
+        )
+        | ternary(
+            ( (cached_install_root | regex_replace('/$', '')) ~ '/AppServer/bin/manageprofiles.sh' ),
+            ( (cached_install_root | regex_replace('/$', '')) ~ '/bin/manageprofiles.sh' )
+          )
+      }}
+  changed_when: false
+
+- name: Validate manageprofiles.sh exists
+  stat:
+    path: "{{ _manageprofiles_path }}"
+  register: mp_stat
+
+- name: Fail if manageprofiles.sh not found
+  assert:
+    that:
+      - mp_stat.stat.exists | default(false)
+    fail_msg: "manageprofiles.sh not found at {{ _manageprofiles_path }}."
+
+- name: List profiles using manageprofiles.sh -listProfiles
+  shell: "{{ _manageprofiles_path }} -listProfiles"
+  register: mp_list
+  changed_when: false
+  failed_when: false
+  become: true
+
+- name: Parse profile names from manageprofiles output (supports [a, b] format)
+  set_fact:
+    _profiles: >-
+      {{
+        (
+          (mp_list.stdout | default('') | trim)
+          | regex_replace('^\\[', '')
+          | regex_replace('\\]$', '')
+          | split(',')
+          | map('trim')
+          | reject('equalto','')
+          | list
+        )
+        if ((mp_list.stdout | default('') | trim) is string and (mp_list.stdout | default('') | trim) | length > 0)
+        else
+        (
+          (mp_list.stdout_lines | default([]))
+          | map('trim')
+          | reject('equalto','')
+          | list
+        )
+      }}
+  changed_when: false
+
+- name: Debug - parsed profile list
+  when: wsjvm_debug | bool
+  debug:
+    msg:
+      cached_install_root: "{{ cached_install_root }}"
+      manageprofiles_path: "{{ _manageprofiles_path }}"
+      raw_manageprofiles: "{{ mp_list.stdout | default('') | trim }}"
+      parsed_profiles: "{{ _profiles }}"
+
+- name: Fail if no profiles returned by manageprofiles
+  assert:
+    that:
+      - _profiles | length > 0
+    fail_msg: "manageprofiles.sh returned no profiles on {{ inventory_hostname }}."
+
+- name: Check which profile contains the stopped JVM via serverStatus.sh -all
+  shell: "{{ _install_root_norm }}/profiles/{{ prof }}/bin/serverStatus.sh -all"
+  register: prof_status
+  changed_when: false
+  failed_when: false
+  become: true
+  loop: "{{ _profiles }}"
+  loop_control:
+    loop_var: prof
+    label: "{{ prof }}"
+
+- name: Pick the first matching profile (by ADMU0506I Server name)
+  set_fact:
+    _match: >-
+      {{
+        (prof_status.results | default([]))
+        | selectattr('stdout', 'defined')
+        | selectattr('stdout', 'search', 'ADMU0506I: Server name: ' ~ (stopped_jvm_name | regex_escape))
+        | list
+        | first | default({})
+      }}
+  changed_when: false
+
+- name: Set discovered profile facts
+  set_fact:
+    discovered_profile_name: "{{ _match.prof | default('') }}"
+    discovered_profile_dir: "{{ _install_root_norm }}/profiles/{{ _match.prof | default('') }}"
+    discovered_profile_bin: "{{ _install_root_norm }}/profiles/{{ _match.prof | default('') }}/bin"
+  changed_when: false
+
+- name: Fail if stopped JVM profile not found from serverStatus checks
+  assert:
+    that:
+      - discovered_profile_name | length > 0
+    fail_msg: >-
+      Could not find a profile containing server '{{ stopped_jvm_name }}' using serverStatus.sh -all.
+      Checked profiles: {{ _profiles }}
