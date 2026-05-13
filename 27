@@ -1,17 +1,14 @@
-- name: Parse profile names from manageprofiles output (EXACT: [a, b, c])
+- name: Parse profile names from manageprofiles output 
   set_fact:
     _profiles: >-
       {{
         (mp_list.stdout | default('') | trim)
         | regex_replace('^\\[', '')
         | regex_replace('\\]$', '')
-        | regex_findall('[^,\\s]+')
-        | map('trim')
-        | reject('equalto','')
+        | regex_findall('[A-Za-z0-9._-]+')
         | list
       }}
   changed_when: false
-
 
 ---
 # Find owning profile for a STOPPED JVM using:
