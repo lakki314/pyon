@@ -1,13 +1,17 @@
-- name: Parse profile names from manageprofiles output 
+- name: Normalize manageprofiles output to one profile per line (no Jinja parsing)
+  shell: >-
+    {{ _manageprofiles_path }} -listProfiles
+    | tr -d '[]'
+    | tr ',' '\n'
+    | awk '{gsub(/^[ \t]+|[ \t]+$/, "", $0); if (length($0)>0) print $0}'
+  register: mp_profiles
+  changed_when: false
+  failed_when: false
+  become: true
+
+- name: Set profile list from normalized output
   set_fact:
-    _profiles: >-
-      {{
-        (mp_list.stdout | default('') | trim)
-        | regex_replace('^\\[', '')
-        | regex_replace('\\]$', '')
-        | regex_findall('[A-Za-z0-9._-]+')
-        | list
-      }}
+    _profiles: "{{ mp_profiles.stdout_lines | default([]) }}"
   changed_when: false
 
 ---
