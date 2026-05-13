@@ -1,17 +1,14 @@
-- name: Parse profile names from manageprofiles output (EXACT: [a, b])
+- name: Parse profile names from manageprofiles output (EXACT: [a, b, c])
   set_fact:
     _profiles: >-
       {{
-        (
-          (mp_list.stdout | default('') | trim)
-          | regex_replace('^\\[', '')
-          | regex_replace('\\]$', '')
-          | regex_replace(',\\s*', '\n')
-          | splitlines()
-          | map('trim')
-          | reject('equalto','')
-          | list
-        )
+        (mp_list.stdout | default('') | trim)
+        | regex_replace('^\\[', '')
+        | regex_replace('\\]$', '')
+        | regex_findall('[^,\\s]+')
+        | map('trim')
+        | reject('equalto','')
+        | list
       }}
   changed_when: false
 
