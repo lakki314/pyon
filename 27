@@ -1,16 +1,13 @@
-- name: Parse profile names from manageprofiles output (robust)
+- name: Parse profile names from manageprofiles output (EXACT: [a, b])
   set_fact:
     _profiles: >-
       {{
         (
-          # Prefer extracting inside [ ... ] if present anywhere in stdout
-          (
-            (mp_list.stdout | default('') | trim)
-            | regex_search('\\[(.*?)\\]', '\\1')
-            | default(mp_list.stdout | default('') | trim)
-          )
-          # Now extract tokens that look like profile names
-          | regex_findall('[A-Za-z0-9._-]+')
+          (mp_list.stdout | default('') | trim)
+          | regex_replace('^\\[', '')
+          | regex_replace('\\]$', '')
+          | regex_replace(',\\s*', '\n')
+          | splitlines()
           | map('trim')
           | reject('equalto','')
           | list
