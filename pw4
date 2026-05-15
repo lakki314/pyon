@@ -1,0 +1,23 @@
+# Hostname Mapping Properties File
+# This file is used by update_datasource_hostnames.py script
+# 
+# Instructions:
+# 1. Set the old hostname that needs to be replaced
+# 2. Set the new hostname to replace it with
+# 3. Optionally set alternative hostnames (comma-separated)
+#
+# Example:
+# old.hostname=olddb.example.com
+# new.hostname=newdb.example.com
+# old.alternative.hostnames=olddb2.example.com,olddb3.example.com
+# new.alternative.hostnames=newdb2.example.com,newdb3.example.com
+
+# Primary hostname mapping (REQUIRED)
+old.hostname=oldhost.example.com
+new.hostname=newhost.example.com
+
+# Alternative hostnames mapping (OPTIONAL)
+# Used for datasources with failover/alternate server configurations
+# Separate multiple hostnames with commas
+old.alternative.hostnames=oldhost2.example.com,oldhost3.example.com
+new.alternative.hostnames=newhost2.example.com,newhost3.example.com
