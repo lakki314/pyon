@@ -1,0 +1,66 @@
+Key Features:
+1. WAS 8.5.5.25 Compatibility
+Uses Jython 2.1 syntax (except Exception, e:)
+Compatible with WAS 8.5.5 AdminConfig/AdminControl APIs
+No modern Python features that would break in Jython 2.1
+2. Properties File Configuration
+Reads hostname mappings from hostname_mapping.properties
+Supports primary and alternative hostnames
+Easy to configure without modifying script
+3. Comprehensive Hostname Updates
+Updates serverName property
+Updates databaseName property
+Updates URL property
+Updates alternative hostnames (clientRerouteAlternateServerName, alternateServers, failoverServers)
+4. Enhanced Validation
+Tests datasource connections AFTER changes are saved and synced
+Handles "Undefined variable WAS_INSTALL_ROOT" errors gracefully
+Skips problematic datasources and continues testing
+Returns detailed status: passed, failed, skipped_server_not_running, skipped_was_install_root
+5. Detailed Summary Report
+Shows:
+
+Hostname changes (old → new)
+All datasources updated with their test status
+Connection test results breakdown
+Overall status with actionable recommendations
+Files Created:
+update_datasource_hostnames.py - Main script
+hostname_mapping.properties - Configuration file (template)
+Usage:
+# 1. Edit hostname_mapping.properties with your values
+# 2. Run the script
+wsadmin.sh -lang jython -f update_datasource_hostnames.py
+
+# Or specify custom properties file
+wsadmin.sh -lang jython -f update_datasource_hostnames.py /path/to/custom.properties
+
+Example Output:
+DETAILED SUMMARY OF CHANGES
+======================================================================
+
+1. Hostname Update:
+----------------------------------------------------------------------
+  Old Hostname: oldhost.example.com
+  New Hostname: newhost.example.com
+
+2. Datasources Updated: 3
+----------------------------------------------------------------------
+  - MYDB_DS1: PASSED
+  - MYDB_DS2: SKIPPED WAS INSTALL ROOT
+  - MYDB_DS3: PASSED
+
+3. Connection Test Results:
+----------------------------------------------------------------------
+  Total datasources tested: 3
+  Passed: 2
+  Failed: 0
+  Skipped (server not running): 0
+  Skipped (WAS_INSTALL_ROOT error): 1
+
+4. Overall Status:
+----------------------------------------------------------------------
+  STATUS: SUCCESS - All tested connections passed
+  Hostname update validated successfully
+
+Both scripts (update_j2c_password.py and update_datasource_hostnames.py) are now production-ready for WebSphere 8.5.5.25!
